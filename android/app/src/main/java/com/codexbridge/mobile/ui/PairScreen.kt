@@ -42,10 +42,19 @@ import com.codexbridge.mobile.UiState
 fun PairScreen(
     state: UiState,
     onDiscover: () -> Unit,
-    onPair: (String, String) -> Unit,
+    onDiscoveryPort: (Int) -> Unit,
+    onPair: (String, String, String) -> Unit,
 ) {
-    var host by remember { mutableStateOf(state.baseUrl.ifBlank { "" }) }
+    var lanHost by remember(state.lanUrl, state.wanUrl, state.baseUrl) {
+        mutableStateOf(
+            state.lanUrl.ifBlank {
+                if (state.wanUrl.isBlank()) state.baseUrl else ""
+            },
+        )
+    }
+    var wanHost by remember(state.wanUrl) { mutableStateOf(state.wanUrl) }
     var code by remember { mutableStateOf("") }
+    var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -88,6 +97,19 @@ fun PairScreen(
                         Text("扫描")
                     }
                 }
+                OutlinedTextField(
+                    value = discoveryPort,
+                    onValueChange = { value ->
+                        val digits = value.filter { it.isDigit() }.take(5)
+                        discoveryPort = digits
+                        digits.toIntOrNull()?.let(onDiscoveryPort)
+                    },
+                    label = { Text("扫描端口") },
+                    supportingText = { Text("电脑端改过手机发现端口时，这里要填相同值。") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 if (state.discovered.isEmpty()) {
                     Text(
                         text = "电脑端打开 CodexBridge 后即可被扫描到。",
@@ -99,7 +121,7 @@ fun PairScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { host = bridge.baseUrl }
+                                .clickable { lanHost = bridge.baseUrl }
                                 .padding(vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -119,10 +141,22 @@ fun PairScreen(
         }
 
         OutlinedTextField(
-            value = host,
-            onValueChange = { host = it },
-            label = { Text("电脑地址") },
-            placeholder = { Text("192.168.1.10:8790") },
+            value = lanHost,
+            onValueChange = { lanHost = it },
+            label = { Text("内网地址") },
+            placeholder = { Text("192.168.1.10:8568") },
+            supportingText = { Text("和电脑在同一 Wi-Fi 时优先使用。") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        OutlinedTextField(
+            value = wanHost,
+            onValueChange = { wanHost = it },
+            label = { Text("外网地址（可选）") },
+            placeholder = { Text("tokenplanx.vip:8080") },
+            supportingText = { Text("离开局域网后自动切换到这个地址。") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier.fillMaxWidth(),
@@ -139,8 +173,8 @@ fun PairScreen(
         )
 
         Button(
-            onClick = { onPair(host, code) },
-            enabled = !state.busy && host.isNotBlank() && code.length == 6,
+            onClick = { onPair(lanHost, wanHost, code) },
+            enabled = !state.busy && (lanHost.isNotBlank() || wanHost.isNotBlank()) && code.length == 6,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(if (state.busy) "正在连接..." else "连接电脑")

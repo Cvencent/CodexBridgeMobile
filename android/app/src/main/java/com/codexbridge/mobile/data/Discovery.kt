@@ -6,7 +6,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 
 @Serializable
@@ -14,8 +16,8 @@ data class DiscoveryPayload(
     val service: String = "",
     val name: String = "",
     val version: String = "",
-    val port: Int = 8790,
-    val discovery_port: Int = 8766,
+    val port: Int = ApiClient.DEFAULT_PORT,
+    val discovery_port: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
     val requires_pairing: Boolean = true,
 )
 
@@ -29,30 +31,42 @@ data class DiscoveredBridge(
 }
 
 object Discovery {
-    private const val DISCOVERY_PORT = 8766
-    private const val TIMEOUT_MS = 2600L
+    private const val TIMEOUT_MS = 3500L
     private val requestBytes = "CODEXBRIDGE_COMPANION_DISCOVER".toByteArray(Charsets.UTF_8)
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    suspend fun discover(timeoutMs: Long = TIMEOUT_MS): List<DiscoveredBridge> =
+    suspend fun discover(
+        discoveryPort: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
+        timeoutMs: Long = TIMEOUT_MS,
+    ): List<DiscoveredBridge> =
         withContext(Dispatchers.IO) {
             val socket = DatagramSocket()
             try {
                 socket.broadcast = true
-                socket.soTimeout = 500
-                socket.send(
-                    DatagramPacket(
-                        requestBytes,
-                        requestBytes.size,
-                        InetAddress.getByName("255.255.255.255"),
-                        DISCOVERY_PORT,
-                    ),
-                )
+                socket.soTimeout = 400
+
+                val targets = broadcastTargets()
                 val found = linkedMapOf<String, DiscoveredBridge>()
                 val deadline = System.currentTimeMillis() + timeoutMs
-                val buffer = ByteArray(1024)
+                var nextSend = 0L
                 while (System.currentTimeMillis() < deadline) {
-                    val response = DatagramPacket(buffer, buffer.size)
+                    val now = System.currentTimeMillis()
+                    if (now >= nextSend) {
+                        targets.forEach { target ->
+                            runCatching {
+                                socket.send(
+                                    DatagramPacket(
+                                        requestBytes,
+                                        requestBytes.size,
+                                        InetAddress.getByName(target),
+                                        discoveryPort,
+                                    ),
+                                )
+                            }
+                        }
+                        nextSend = now + 650L
+                    }
+                    val response = DatagramPacket(ByteArray(1024), 1024)
                     try {
                         socket.receive(response)
                     } catch (_error: SocketTimeoutException) {
@@ -78,4 +92,21 @@ object Discovery {
                 socket.close()
             }
         }
+
+    private fun broadcastTargets(): List<String> {
+        val targets = linkedSetOf("255.255.255.255")
+        runCatching {
+            NetworkInterface.getNetworkInterfaces().toList().forEach { network ->
+                if (!network.isUp || network.isLoopback) return@forEach
+                network.interfaceAddresses.forEach { address ->
+                    val source = address.address
+                    val broadcast = address.broadcast
+                    if (source is Inet4Address && broadcast is Inet4Address) {
+                        targets.add(broadcast.hostAddress ?: return@forEach)
+                    }
+                }
+            }
+        }
+        return targets.toList()
+    }
 }

@@ -2,6 +2,8 @@ package com.codexbridge.mobile.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,10 +27,12 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -39,11 +43,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,7 +65,14 @@ import androidx.compose.ui.unit.sp
 import com.codexbridge.mobile.UiState
 import com.codexbridge.mobile.data.ApprovalRequest
 import com.codexbridge.mobile.data.MessageItem
+import com.codexbridge.mobile.data.QueueItem
 import java.util.Locale
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -65,21 +80,69 @@ fun ChatScreen(
     state: UiState,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
+    onConsumeRestoreInput: () -> Unit = {},
     onStop: () -> Unit,
     onPickModel: (String) -> Unit,
     onResolveApproval: (Int, String) -> Unit,
+    onRespondApproval: (Int, JsonObject) -> Unit,
+    onSteerQueue: (QueueItem) -> Unit = {},
+    onEditQueue: (QueueItem, String) -> Unit = { _, _ -> },
+    onDeleteQueue: (QueueItem) -> Unit = {},
 ) {
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
+    var editingQueue by remember { mutableStateOf<QueueItem?>(null) }
+    var editingText by remember { mutableStateOf("") }
+    var deletingQueue by remember { mutableStateOf<QueueItem?>(null) }
+    LaunchedEffect(state.restoreInput) {
+        if (state.restoreInput.isNotBlank()) {
+            input = state.restoreInput
+            onConsumeRestoreInput()
+        }
+    }
     val listState = rememberLazyListState()
-
-    LaunchedEffect(state.messages.size, state.streaming.size, state.working, state.approvals.size) {
-        val target = state.messages.size + state.approvals.size
-        if (target > 0) {
-            listState.animateScrollToItem(target - 1)
+    val scope = rememberCoroutineScope()
+    val threadKey = state.activeThread?.thread_id.orEmpty()
+    val itemCount = state.messages.size + state.approvals.size
+    var lastBottomId by remember(threadKey) { mutableStateOf("") }
+    var userScrolledUp by remember(threadKey) { mutableStateOf(false) }
+    val pinnedToBottom by remember {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val last = layout.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= layout.totalItemsCount - 1 ||
+                listState.canScrollForward.not()
+        }
+    }
+    val showJumpToBottom by remember {
+        derivedStateOf {
+            listState.canScrollBackward && (!pinnedToBottom || userScrolledUp)
         }
     }
 
+    // Opening a thread jumps straight to the newest message.
+    LaunchedEffect(threadKey) {
+        if (threadKey.isNotBlank()) {
+            listState.scrollToItem(0)
+            if (itemCount > 0) listState.scrollToItem(itemCount - 1)
+        }
+    }
+    // A newly loaded message scrolls to the bottom instantly; deltas only
+    // follow while the user is already reading the bottom of the list.
+    LaunchedEffect(threadKey, itemCount) {
+        val lastId = state.messages.lastOrNull()?.id
+            ?: state.approvals.lastOrNull()?.let { "approval-" + it.request_id }
+            ?: ""
+        if (lastId.isNotBlank() && lastId != lastBottomId) {
+            lastBottomId = lastId
+            listState.scrollToItem(itemCount - 1)
+        }
+    }
+    LaunchedEffect(threadKey, state.streaming.size, state.working, state.task.current_action) {
+        if (itemCount > 0 && pinnedToBottom) {
+            listState.scrollToItem(itemCount - 1)
+        }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -135,18 +198,73 @@ fun ChatScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.messages, key = { it.id.ifBlank { it.hashCode().toString() } }) { item ->
-                    MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
+            if (state.task.status == "failed" && state.task.errorMessage.isNotBlank()) {
+                ChatBanner(
+                    text = "上一轮失败：" + state.task.errorMessage,
+                    accent = MaterialTheme.colorScheme.error,
+                )
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(state.messages, key = { it.id.ifBlank { it.hashCode().toString() } }) { item ->
+                        MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
+                    }
+                    items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
+                        ApprovalCard(approval = approval, onDecision = onResolveApproval, onResponse = onRespondApproval)
+                    }
                 }
-                items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
-                    ApprovalCard(approval = approval, onDecision = onResolveApproval)
+                if (state.chatLoading) {
+                    Column(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "正在加载会话…",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
+                if (showJumpToBottom) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 10.dp)
+                            .clickable {
+                                val target = state.messages.size + state.approvals.size
+                                if (target > 0) scope.launch { listState.scrollToItem(target - 1) }
+                            },
+                        shape = RoundedCornerShape(999.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        tonalElevation = 4.dp,
+                    ) {
+                        Text(
+                            text = "回到底部",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+            }
+            if (state.queue.isNotEmpty()) {
+                QueuePanel(
+                    items = state.queue,
+                    working = state.working,
+                    onSteer = onSteerQueue,
+                    onEdit = { item ->
+                        editingQueue = item
+                        editingText = item.text
+                    },
+                    onDelete = { item -> deletingQueue = item },
+                )
             }
             if (state.working) {
                 Row(
@@ -176,7 +294,7 @@ fun ChatScreen(
                     value = input,
                     onValueChange = { input = it },
                     placeholder = {
-                        Text(if (state.working) "发送将追加到当前任务" else "给 Codex 发消息…", maxLines = 1)
+                        Text("发送后加入队列", maxLines = 1)
                     },
                     maxLines = 5,
                     shape = RoundedCornerShape(16.dp),
@@ -191,19 +309,61 @@ fun ChatScreen(
                             onSend(text)
                         }
                     },
-                    enabled = input.isNotBlank(),
+                    enabled = input.isNotBlank() && !state.sending,
                     modifier = Modifier
                         .size(48.dp)
                         .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
                 ) {
-                    Icon(
-                        Icons.Filled.Send,
-                        contentDescription = "发送",
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                    )
+                    if (state.sending) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Send,
+                            contentDescription = "发送",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    }
                 }
             }
         }
+    }
+
+    deletingQueue?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deletingQueue = null },
+            title = { Text("删除队列项") },
+            text = { Text(target.text, maxLines = 4, overflow = TextOverflow.Ellipsis) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        deletingQueue = null
+                        onDeleteQueue(target)
+                    },
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletingQueue = null }) { Text("取消") }
+            },
+        )
+    }
+
+    if (editingQueue != null) {
+        EditQueueDialog(
+            text = editingText,
+            onTextChange = { editingText = it },
+            onSave = {
+                val target = editingQueue
+                if (target != null && editingText.trim().isNotEmpty()) {
+                    onEditQueue(target, editingText.trim())
+                }
+                editingQueue = null
+            },
+            onDismiss = { editingQueue = null },
+        )
     }
 
     if (showModels) {
@@ -215,6 +375,95 @@ fun ChatScreen(
                 onPickModel(model.slug)
             },
             onDismiss = { showModels = false },
+        )
+    }
+}
+
+@Composable
+private fun QueuePanel(
+    items: List<QueueItem>,
+    working: Boolean,
+    onSteer: (QueueItem) -> Unit,
+    onEdit: (QueueItem) -> Unit,
+    onDelete: (QueueItem) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "待发送队列 · ${items.size}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            items.forEach { item ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(item.text, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (working && item.status == "pending" && item.revision > 0) {
+                            TextButton(onClick = { onSteer(item) }) { Text("引导") }
+                        }
+                        if (item.status == "pending" || item.status == "failed") {
+                            TextButton(onClick = { onEdit(item) }) { Text("编辑") }
+                            TextButton(onClick = { onDelete(item) }) { Text("删除") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EditQueueDialog(
+    text: String,
+    onTextChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("编辑队列项") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = onTextChange,
+                label = { Text("内容") },
+                minLines = 3,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onSave, enabled = text.trim().isNotEmpty()) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+@Composable
+private fun ChatBanner(text: String, accent: androidx.compose.ui.graphics.Color) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = accent.copy(alpha = 0.14f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.5f)),
+    ) {
+        Text(
+            text = text,
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
         )
     }
 }
@@ -498,8 +747,11 @@ private fun NoticeLine(text: String) {
 }
 
 @Composable
-private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) -> Unit) {
+private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) -> Unit,
+                         onResponse: (Int, JsonObject) -> Unit) {
     val detail = approval.raw
+    var answers by remember(approval.request_id) { mutableStateOf(mapOf<String, String>()) }
+    var structured by remember(approval.request_id) { mutableStateOf("{}") }
     val diff = detail.diff.ifBlank { detail.patch }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -545,12 +797,18 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
                         Text(text = question.question, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                     }
                     if (question.options.isNotEmpty()) {
-                        Text(
-                            text = question.options.joinToString(" / "),
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        question.options.forEach { option ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                androidx.compose.material3.RadioButton(
+                                    selected = answers[question.id] == option,
+                                    onClick = { answers = answers + (question.id to option) })
+                                Text(option, modifier = Modifier.weight(1f))
+                            }
+                        }
                     }
+                    OutlinedTextField(value = answers[question.id].orEmpty(),
+                        onValueChange = { answers = answers + (question.id to it) },
+                        label = { Text("回答") }, modifier = Modifier.fillMaxWidth())
                 }
             }
             if (approval.reason.isNotBlank()) {
@@ -570,7 +828,31 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
             ) {
                 Text(text = detail.message, fontSize = 13.sp)
             }
-            Row(
+            if (approval.kind == "permissions" || approval.kind == "mcp") {
+                OutlinedTextField(value = structured, onValueChange = { structured = it },
+                    label = { Text(if (approval.kind == "permissions") "授权范围 JSON" else "表单内容 JSON") },
+                    modifier = Modifier.fillMaxWidth(), minLines = 3)
+            }
+            if (approval.kind in setOf("input", "permissions", "mcp")) {
+                val parsed = runCatching { Json.parseToJsonElement(structured) as? JsonObject }.getOrNull()
+                Button(onClick = {
+                    val response = buildJsonObject {
+                        when (approval.kind) {
+                            "input" -> put("answers", buildJsonObject {
+                                answers.forEach { (id, answer) -> put(id, buildJsonObject {
+                                    put("answers", JsonArray(listOf(JsonPrimitive(answer))))
+                                }) }
+                            })
+                            "permissions" -> { put("permissions", parsed!!); put("scope", "turn") }
+                            "mcp" -> { put("action", "accept"); put("content", parsed!!) }
+                        }
+                    }
+                    onResponse(approval.request_id, response)
+                }, enabled = if (approval.kind == "input")
+                    detail.questions.all { !answers[it.id].isNullOrBlank() } else parsed != null) {
+                    Text("提交")
+                }
+            } else Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {

@@ -1,7 +1,9 @@
 package com.codexbridge.mobile.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,6 +27,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -48,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.codexbridge.mobile.UiState
 import com.codexbridge.mobile.data.ThreadSummary
+import com.codexbridge.mobile.data.sortThreadsByActivity
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -78,8 +83,19 @@ fun ThreadsScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onRefresh) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                    IconButton(onClick = onRefresh, enabled = !state.manualRefreshing) {
+                        // The icon and the spinner share one fixed-size slot, so
+                        // the app bar never resizes while a sync runs.
+                        Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                            if (state.manualRefreshing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                            }
+                        }
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "设置")
@@ -105,13 +121,48 @@ fun ThreadsScreen(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // One fixed-height row carries the sync state. The background
+                // poll updates the text in place instead of mounting and
+                // unmounting a spinner, which used to make the list blink.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().height(28.dp),
+                ) {
                     Text(
                         text = "共 ${state.threads.size} 个任务",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.weight(1f),
                     )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(modifier = Modifier.size(14.dp), contentAlignment = Alignment.Center) {
+                        if (state.manualRefreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(12.dp),
+                                strokeWidth = 1.5.dp,
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .background(
+                                        MaterialTheme.colorScheme.secondary,
+                                        RoundedCornerShape(999.dp),
+                                    ),
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (state.manualRefreshing) "正在刷新…" else syncLabel(state.lastRefreshedAt),
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        color = if (state.manualRefreshing) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
                     TextButton(onClick = onSearchSubmit) { Text("搜索") }
                 }
                 state.error?.let { message ->
@@ -128,7 +179,7 @@ fun ThreadsScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(state.threads, key = { it.thread_id }) { thread ->
+                items(sortThreadsByActivity(state.threads), key = { it.thread_id }) { thread ->
                     ThreadCard(thread = thread, onClick = { onOpenThread(thread.thread_id) })
                 }
                 if (state.threads.isEmpty()) {
@@ -157,6 +208,32 @@ fun ThreadsScreen(
     }
 }
 
+private fun syncLabel(millis: Long): String {
+    if (millis <= 0) return "等待同步"
+    val seconds = ((System.currentTimeMillis() - millis) / 1000).coerceAtLeast(0)
+    return when {
+        seconds < 3 -> "已同步 · 刚刚"
+        seconds < 60 -> "已同步 · ${seconds} 秒前"
+        seconds < 3600 -> "已同步 · ${seconds / 60} 分钟前"
+        else -> "已同步 · ${seconds / 3600} 小时前"
+    }
+}
+
+private fun isActiveStatus(status: String): Boolean =
+    status == "working" || status == "waiting_user"
+
+private fun threadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
+    threads.sortedWith(
+        compareBy<ThreadSummary> { if (isActiveStatus(it.status)) 0 else 1 }
+            .thenByDescending { maxOf(it.recency_at, it.updated_at) },
+    )
+
+private fun workspaceLabel(thread: ThreadSummary): String {
+    if (thread.workspace.isNotBlank()) return thread.workspace
+    val parts = thread.cwd.trimEnd('\\', '/').split('\\', '/').filter { it.isNotBlank() }
+    return parts.lastOrNull() ?: "默认目录"
+}
+
 @Composable
 private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
     Card(
@@ -183,6 +260,18 @@ private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("工作空间", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = workspaceLabel(thread),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {

@@ -7,7 +7,10 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -92,13 +95,32 @@ class ApiClient(
             ),
         )
 
+    private suspend fun command(method: String, params: JsonObject): String =
+        commandPayload(
+            postText(
+                "/api/companion/commands",
+                buildJsonObject {
+                    put("request_id", java.util.UUID.randomUUID().toString())
+                    put("method", method)
+                    put("params", params)
+                },
+            ),
+        )
+
     suspend fun ping(): PingResponse =
         json.decodeFromString(PingResponse.serializer(), getText("/api/companion/ping"))
 
-    suspend fun pair(code: String, name: String): PairResponse =
+    suspend fun pair(code: String, name: String, clientId: String = ""): PairResponse =
         json.decodeFromString(
             PairResponse.serializer(),
-            postText("/api/companion/pair", buildJsonObject { put("code", code); put("name", name) }),
+            postText(
+                "/api/companion/pair",
+                buildJsonObject {
+                    put("code", code)
+                    put("name", name)
+                    if (clientId.isNotBlank()) put("client_id", clientId)
+                },
+            ),
         )
 
     suspend fun status(): StatusResponse =
@@ -153,6 +175,88 @@ class ApiClient(
             ),
         )
 
+    suspend fun queue(threadId: String): QueueResponse =
+        json.decodeFromString(
+            QueueResponse.serializer(),
+            command(
+                "queue.list",
+                buildJsonObject { put("thread_id", threadId) },
+            ),
+        )
+
+    suspend fun enqueueMessage(
+        threadId: String,
+        text: String,
+        model: String = "",
+        effort: String = "",
+    ): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.enqueue",
+                buildJsonObject {
+                    put("thread_id", threadId)
+                    put("text", text)
+                    if (model.isNotBlank()) put("model", model)
+                    if (effort.isNotBlank()) put("effort", effort)
+                },
+            ),
+        )
+
+    suspend fun steerQueue(queueId: String, expectedRevision: Long): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.steer",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("expected_revision", expectedRevision)
+                },
+            ),
+        )
+
+    suspend fun editQueue(
+        queueId: String,
+        text: String,
+        expectedRevision: Long,
+        model: String = "",
+        effort: String = "",
+    ): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.edit",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("text", text)
+                    put("expected_revision", expectedRevision)
+                    if (model.isNotBlank()) put("model", model)
+                    if (effort.isNotBlank()) put("effort", effort)
+                },
+            ),
+        )
+
+    suspend fun deleteQueue(queueId: String, expectedRevision: Long): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.delete",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("expected_revision", expectedRevision)
+                },
+            ),
+        )
+
+    suspend fun markThreadRead(threadId: String): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            postText(
+                "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/read",
+                buildJsonObject { },
+            ),
+        )
+
     suspend fun interrupt(threadId: String, turnId: String = ""): SendResponse =
         json.decodeFromString(
             SendResponse.serializer(),
@@ -168,6 +272,15 @@ class ApiClient(
             postText(
                 "/api/companion/approvals/$requestId",
                 buildJsonObject { put("decision", decision) },
+            ),
+        )
+
+    suspend fun respondApproval(requestId: Int, response: JsonObject): ActionResponse =
+        json.decodeFromString(
+            ActionResponse.serializer(),
+            command(
+                "approval.respond",
+                buildJsonObject { put("approval_id", requestId); put("response", response) },
             ),
         )
 
@@ -187,7 +300,7 @@ class ApiClient(
         val listener = object : EventSourceListener() {
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 if (data.isBlank()) return
-                val parsed = runCatching { json.decodeFromString(StreamEvent.serializer(), data) }.getOrNull()
+                val parsed = decodeStreamEvent(data)
                 if (parsed != null) {
                     trySend(parsed)
                 }
@@ -207,6 +320,28 @@ class ApiClient(
     }
 
     companion object {
+        const val DEFAULT_PORT = 8568
+        const val DEFAULT_DISCOVERY_PORT = 8569
+        private const val LEGACY_DEFAULT_PORT = 8790
+        private const val LEGACY_COMPANION_PORT = 8791
+        private const val LEGACY_DISCOVERY_PORT = 8766
+
+        internal fun commandPayload(text: String): String {
+            val envelope = Json.parseToJsonElement(text).jsonObject
+            if (envelope["ok"]?.jsonPrimitive?.booleanOrNull != true) {
+                val code = envelope["error"]?.jsonPrimitive?.content ?: "invalid_command_result"
+                throw ApiException("请求未确认（$code）", code)
+            }
+            val result = envelope["result"] as? JsonObject
+                ?: throw ApiException("无效的命令响应", "invalid_command_result")
+            return JsonObject(result + ("ok" to kotlinx.serialization.json.JsonPrimitive(true))).toString()
+        }
+
+        fun migrateStoredBase(value: String): String {
+            val text = value.trim()
+            return if (text.isEmpty()) "" else normalizeBase(text)
+        }
+
         fun normalizeBase(value: String): String {
             var text = value.trim()
             if (text.isEmpty()) {
@@ -220,9 +355,33 @@ class ApiClient(
             val hostPart = rest.substringBefore('/')
             val tail = rest.substring(hostPart.length)
             if (hostPart.isNotBlank() && !hostPart.contains(':')) {
-                text = text.substring(0, schemeEnd) + hostPart + ":8790" + tail
+                text = text.substring(0, schemeEnd) + hostPart + ":$DEFAULT_PORT" + tail
+            } else if (
+                hostPart.endsWith(":$LEGACY_DEFAULT_PORT") ||
+                hostPart.endsWith(":$LEGACY_COMPANION_PORT") ||
+                hostPart.endsWith(":$LEGACY_DISCOVERY_PORT")
+            ) {
+                text = text.substring(0, schemeEnd) +
+                    hostPart.substringBeforeLast(':') +
+                    ":$DEFAULT_PORT" +
+                    tail
             }
             return text.trimEnd('/')
+        }
+
+        fun withPort(value: String, port: Int): String {
+            if (port !in 1..65535) throw ApiException("端口无效")
+            var text = value.trim()
+            if (text.isEmpty()) throw ApiException("请填写电脑地址")
+            if (!text.startsWith("http://") && !text.startsWith("https://")) {
+                text = "http://$text"
+            }
+            val schemeEnd = text.indexOf("://") + 3
+            val rest = text.substring(schemeEnd)
+            val hostPart = rest.substringBefore('/')
+            val tail = rest.substring(hostPart.length)
+            val host = hostPart.substringBeforeLast(':', hostPart)
+            return (text.substring(0, schemeEnd) + host + ":$port" + tail).trimEnd('/')
         }
     }
 }

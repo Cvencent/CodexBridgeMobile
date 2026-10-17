@@ -2,6 +2,11 @@ package com.codexbridge.mobile.data
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
 
 @Serializable
 data class PingResponse(
@@ -30,11 +35,69 @@ data class PairResponse(
 )
 
 @Serializable
+data class QueueItem(
+    @SerialName("queue_id") val queue_id: String = "",
+    @SerialName("thread_id") val thread_id: String = "",
+    val text: String = "",
+    val model: String = "",
+    val effort: String = "",
+    val status: String = "pending",
+    val revision: Long = 0,
+    // Bridge stamps these with wall-clock time, so they carry a fractional part.
+    @SerialName("created_at") val createdAt: Double = 0.0,
+    @SerialName("updated_at") val updatedAt: Double = 0.0,
+    @SerialName("created_by") val createdBy: String = "",
+    @SerialName("created_by_kind") val createdByKind: String = "",
+    val error: String = "",
+)
+
+@Serializable
+data class QueueResponse(
+    val ok: Boolean = false,
+    @SerialName("thread_id") val threadId: String = "",
+    @SerialName("items") val queue: List<QueueItem> = emptyList(),
+    val revision: Long = 0,
+)
+
+@Serializable
+data class QueueSnapshot(
+    @SerialName("thread_id") val threadId: String = "",
+    @SerialName("items") val items: List<QueueItem> = emptyList(),
+    val revision: Long = 0,
+    val paused: Boolean = false,
+)
+
+fun applyQueueSnapshot(
+    current: List<QueueItem>,
+    threadId: String,
+    snapshot: List<QueueItem>,
+): List<QueueItem> {
+    val otherThreads = current.filterNot { it.thread_id == threadId }
+    return otherThreads + snapshot.filter { it.thread_id == threadId }.sortedBy { it.createdAt }
+}
+
+fun applyQueueUpdate(
+    current: List<QueueItem>,
+    threadId: String,
+    item: QueueItem,
+    removed: Boolean,
+): List<QueueItem> {
+    if (item.thread_id != threadId) return current
+    if (removed) return current.filterNot { it.queue_id == item.queue_id }
+    val updated = current.filterNot { it.queue_id == item.queue_id } + item
+    return updated.sortedBy { it.createdAt }
+}
+
+@Serializable
 data class SendResponse(
     val ok: Boolean = false,
     val thread_id: String = "",
     val turn_id: String = "",
     val status: String = "",
+    val read_at: Long = 0,
+    // Set when the desktop held the original thread, so the reply continued in
+    // a forked copy that shares its history.
+    val continued_as: String = "",
 )
 
 @Serializable
@@ -74,12 +137,16 @@ data class ThreadSummary(
     val status: String = "idle",
     val model: String = "",
     val cwd: String = "",
+    val workspace: String = "",
     val source: String = "",
     val created_at: Long = 0,
     val updated_at: Long = 0,
     val recency_at: Long = 0,
+    val completed_at: Long = 0,
+    val turn_id: String = "",
     val tokens: Long = 0,
     val ephemeral: Boolean = false,
+    val error_message: String = "",
 )
 
 @Serializable
@@ -149,6 +216,7 @@ data class TaskSnapshot(
     val started_at_epoch: Long = 0,
     val last_updated_epoch: Long = 0,
     val completed_at_epoch: Long = 0,
+    @SerialName("error_message") val errorMessage: String = "",
 ) {
     val isWorking: Boolean get() = status == "working" || status == "waiting_user"
 }
@@ -198,7 +266,9 @@ data class ThreadDetailResponse(
     val messages: List<MessageItem> = emptyList(),
     val message_count: Int = 0,
     val truncated: Boolean = false,
+    val continued_as: String = "",
     val pending_approvals: List<ApprovalRequest> = emptyList(),
+    val queue: QueueSnapshot = QueueSnapshot(),
 )
 
 @Serializable
@@ -253,6 +323,8 @@ data class StreamEvent(
     val item_id: String = "",
     val delta: String = "",
     val status: String = "",
+    val completed_at: Long = 0,
+    val read: Boolean = false,
     val title: String = "",
     val message: String = "",
     val decision: String = "",
@@ -261,7 +333,16 @@ data class StreamEvent(
     val context_window: Long = 0,
     val duration_ms: Long? = null,
     val active_flags: List<String> = emptyList(),
+    val continued_as: String = "",
+    val error_message: String = "",
     val item: MessageItem? = null,
+    // Queue snapshots carry their rows under `items`; single-item queue events
+    // reuse the `item` key, which is why they go through decodeStreamEvent().
+    @SerialName("items") val queue: List<QueueItem> = emptyList(),
+    @SerialName("queue_id") val queueId: String = "",
+    val queueItem: QueueItem? = null,
+    @SerialName("expected_revision") val expectedRevision: Long = 0,
+    val removed: Boolean = false,
     // Approval payload fields.
     val kind: String = "",
     val command: String = "",
@@ -271,6 +352,38 @@ data class StreamEvent(
     val created_at: Double = 0.0,
     val raw: MessageDetail = MessageDetail(),
 )
+
+private val streamEventJson = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+    explicitNulls = false
+}
+
+/**
+ * The Bridge publishes message items and queue items under the same `item`
+ * field, so the event type has to decide how it is parsed. Queue events keep
+ * their row in `queueItem`; everything else decodes normally.
+ */
+fun decodeStreamEvent(raw: String): StreamEvent? {
+    val element = runCatching { Json.parseToJsonElement(raw) }.getOrNull() as? JsonObject
+        ?: return null
+    val type = (element["type"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+    if (!type.startsWith("queue_")) {
+        return runCatching {
+            streamEventJson.decodeFromString(StreamEvent.serializer(), raw)
+        }.getOrNull()
+    }
+    val body = JsonObject(element - "item")
+    val base = runCatching {
+        streamEventJson.decodeFromString(StreamEvent.serializer(), body.toString())
+    }.getOrNull() ?: return null
+    val item = element["item"]?.let { value ->
+        runCatching {
+            streamEventJson.decodeFromJsonElement(QueueItem.serializer(), value)
+        }.getOrNull()
+    }
+    return base.copy(queueItem = item)
+}
 
 @Serializable
 data class ErrorEnvelope(
