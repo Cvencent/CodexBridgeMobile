@@ -2,6 +2,7 @@ package com.codexbridge.mobile.data
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -154,6 +155,7 @@ data class Account(
 @Serializable
 data class ThreadSummary(
     val thread_id: String = "",
+    val topic_id: Long = 0,
     val title: String = "",
     val preview: String = "",
     val status: String = "idle",
@@ -345,6 +347,9 @@ data class ProjectsResponse(
 @Serializable
 data class StreamEvent(
     val type: String = "",
+    @Transient val cbdpTopicId: Long = 0,
+    @Transient val cbdpCursor: Long = 0,
+    @Transient val cbdpScope: Int = 0,
     val thread_id: String = "",
     val turn_id: String = "",
     val item_id: String = "",

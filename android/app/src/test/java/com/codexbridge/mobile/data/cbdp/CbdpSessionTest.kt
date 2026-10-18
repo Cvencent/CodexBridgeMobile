@@ -91,6 +91,25 @@ class CbdpSessionTest {
     }
 
     @Test
+    fun cursorAckCarriesTopicScopeAndCursor() {
+        val session = newSession()
+        helloToReady(session)
+
+        val frame = session.ack(
+            ackSeq = 7,
+            cursor = 4242,
+            topicId = 0x10000007,
+            scope = CbdpScope.THREAD,
+        )
+
+        assertEquals(CbdpMessageType.ACK, frame.header.messageType)
+        assertEquals(7L, frame.header.ackSeq)
+        assertEquals(0x10000007L, frame.tlvs.u32(CbdpTag.TOPIC_ID))
+        assertEquals(CbdpScope.THREAD, frame.tlvs.u8(CbdpTag.SCOPE))
+        assertEquals(4242L, frame.tlvs.u64(CbdpTag.CURSOR))
+    }
+
+    @Test
     fun readySessionBuildsCommandWithIdempotencyAndParams() {
         val session = newSession()
         helloToReady(session)

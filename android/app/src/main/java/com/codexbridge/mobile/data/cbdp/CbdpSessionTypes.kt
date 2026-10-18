@@ -27,6 +27,31 @@ object CbdpScope {
     const val SUMMARY = 0
     const val THREAD = 1
     const val LIVE = 2
+
+    fun fromEvent(eventType: Int): Int = when (eventType) {
+        CbdpEvent.THREAD_CREATED,
+        CbdpEvent.THREAD_UPDATED,
+        CbdpEvent.THREAD_TITLE_CHANGED,
+        CbdpEvent.THREAD_STATUS_CHANGED,
+        CbdpEvent.MESSAGE_READ,
+        CbdpEvent.DEVICE_ONLINE,
+        CbdpEvent.DEVICE_OFFLINE,
+        CbdpEvent.DEVICE_POLICY_CHANGED -> SUMMARY
+
+        CbdpEvent.THREAD_OWNER_CHANGED,
+        CbdpEvent.THREAD_DELETED,
+        CbdpEvent.TURN_COMPLETED,
+        CbdpEvent.TURN_FAILED,
+        CbdpEvent.TURN_INTERRUPTED,
+        CbdpEvent.MESSAGE_APPENDED,
+        CbdpEvent.MESSAGE_UPDATED,
+        CbdpEvent.MESSAGE_DELETED,
+        CbdpEvent.APPROVAL_REQUESTED,
+        CbdpEvent.APPROVAL_RESOLVED,
+        CbdpEvent.APPROVAL_EXPIRED -> THREAD
+
+        else -> LIVE
+    }
 }
 
 object CbdpTopic {

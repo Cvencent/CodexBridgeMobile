@@ -56,6 +56,7 @@ class CbdpEventEnvelope(
     val cursor: Long,
     val eventType: Int,
     val payload: List<CbdpTlv>,
+    val scope: Int = CbdpScope.fromEvent(eventType),
     val rawType: String = "",
     val rawPayload: ByteArray = ByteArray(0),
 )
@@ -95,8 +96,9 @@ class CbdpClient(
     private val pending = mutableMapOf<Long, PendingCommand>()
     private val outbound = linkedMapOf<Long, OutboundFrame>()
     internal val fragments = mutableMapOf<Long, FragmentAssembly>()
-    private val subscriptions = linkedMapOf<Pair<Long, Int>, Long>()
-    private val cursors = linkedMapOf<Long, Long>()
+    private val subscriptions = linkedMapOf<SubscriptionKey, Long>()
+    private val cursors = linkedMapOf<SubscriptionKey, Long>()
+    @Volatile private var sseCursor: Long = 0
     private val _events = MutableSharedFlow<CbdpEventEnvelope>(extraBufferCapacity = 256)
     val events: SharedFlow<CbdpEventEnvelope> = _events.asSharedFlow()
 
@@ -134,6 +136,11 @@ class CbdpClient(
     ) {
         fun isComplete(): Boolean = pieces.size == total && (0 until total).all { pieces.containsKey(it) }
     }
+
+    internal data class SubscriptionKey(
+        val topicId: Long,
+        val scope: Int,
+    )
 
     suspend fun connect() = connectLock.withLock {
         if (session.state == CbdpSessionState.READY && (!sseMode || sseSource != null)) return@withLock
@@ -202,9 +209,7 @@ class CbdpClient(
             .header("Accept", "text/event-stream")
             .apply {
                 authHeaders().forEach { (key, value) -> header(key, value) }
-                synchronized(cursors) { cursors[0L] }
-                    ?.takeIf { it > 0 }
-                    ?.let { header("Last-Event-ID", it.toString()) }
+                sseCursor.takeIf { it > 0 }?.let { header("Last-Event-ID", it.toString()) }
             }
             .build()
         val listener = object : EventSourceListener() {
@@ -217,7 +222,7 @@ class CbdpClient(
                 if (data.isBlank()) return
                 val bytes = runCatching { Base64.getDecoder().decode(data.trim()) }.getOrNull() ?: return
                 id?.toLongOrNull()?.takeIf { it > 0 }?.let { cursor ->
-                    synchronized(cursors) { cursors[0L] = maxOf(cursors[0L] ?: 0L, cursor) }
+                    sseCursor = maxOf(sseCursor, cursor)
                 }
                 receive(bytes)
             }
@@ -300,6 +305,7 @@ class CbdpClient(
                 flags = assembly.originalFlags,
                 payloadLength = payload.size,
                 topicId = assembly.originalTopicId,
+                seq = frame.header.seq,
                 qos = assembly.originalQos,
             ),
             originalTlvs,
@@ -354,11 +360,6 @@ class CbdpClient(
         val cursor = frame.tlvs.u64(CbdpTag.GLOBAL_SEQ)
             ?: frame.tlvs.u64(CbdpTag.CURSOR)
             ?: frame.header.seq
-        if (cursor > 0) {
-            synchronized(cursors) {
-                cursors[frame.header.topicId] = maxOf(cursors[frame.header.topicId] ?: 0L, cursor)
-            }
-        }
         val eventType = frame.tlvs.u16(CbdpTag.EVENT_TYPE) ?: return
         val payload = frame.tlvs.tlv(CbdpTag.EVENT_PAYLOAD).orEmpty()
         _events.tryEmit(
@@ -367,6 +368,25 @@ class CbdpClient(
                 cursor = cursor,
                 eventType = eventType,
                 payload = payload,
+                scope = CbdpScope.fromEvent(eventType),
+            ),
+        )
+    }
+
+    suspend fun acknowledge(topicId: Long, cursor: Long, scope: Int) {
+        if (topicId <= 0 || cursor <= 0) return
+        synchronized(cursors) {
+            val key = SubscriptionKey(topicId, scope)
+            cursors[key] = maxOf(cursors[key] ?: 0L, cursor)
+            subscriptions[key] = cursor
+        }
+        if (session.state != CbdpSessionState.READY) return
+        sendReliable(
+            session.ack(
+                ackSeq = session.bridgeAckPrefix,
+                cursor = cursor,
+                topicId = topicId,
+                scope = scope,
             ),
         )
     }
@@ -510,15 +530,15 @@ class CbdpClient(
         connect()
         val requestId = requestIds.incrementAndGet()
         val frame = session.subscribe(topicId, scope, cursor, requestId)
-        synchronized(subscriptions) { subscriptions[topicId to scope] = cursor }
+        synchronized(subscriptions) { subscriptions[SubscriptionKey(topicId, scope)] = cursor }
         sendReliable(frame)
     }
 
     suspend fun unsubscribe(topicId: Long) {
         val scopes = synchronized(subscriptions) {
-            val matches = subscriptions.filterKeys { it.first == topicId }
+            val matches = subscriptions.filterKeys { it.topicId == topicId }
             matches.keys.forEach(subscriptions::remove)
-            matches.keys.map { it.second }.distinct()
+            matches.keys.map { it.scope }.distinct()
         }
         if (scopes.isEmpty()) return
         if (session.state != CbdpSessionState.READY) return
@@ -666,9 +686,10 @@ class CbdpClient(
     private suspend fun replaySubscriptions() {
         val registrations = synchronized(subscriptions) { subscriptions.toList() }
         registrations.forEach { (registration, cursor) ->
-            val (topicId, scope) = registration
+            val topicId = registration.topicId
+            val scope = registration.scope
             val requestId = requestIds.incrementAndGet()
-            val latest = synchronized(cursors) { cursors[topicId] ?: cursor }
+            val latest = synchronized(cursors) { cursors[registration] ?: cursor }
             sendReliable(session.subscribe(topicId, scope, latest, requestId))
         }
     }

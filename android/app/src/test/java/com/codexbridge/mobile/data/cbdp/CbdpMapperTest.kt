@@ -8,6 +8,69 @@ import org.junit.Test
 
 class CbdpMapperTest {
     @Test
+    fun threadObjectCarriesStableTopicId() {
+        val thread = CbdpMapper.threadFromObject(
+            listOf(
+                CbdpTlv(CbdpTag.OBJECT_TYPE, CbdpCodec.u8(CbdpMapper.OBJECT_THREAD)),
+                CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(7)),
+                CbdpTlv(CbdpTag.TOPIC_ID, CbdpCodec.u32(0x10000007)),
+                CbdpTlv(CbdpTag.TITLE, "Thread 7".toByteArray()),
+            ),
+        )
+
+        assertEquals("7", thread.thread_id)
+        assertEquals(0x10000007L, thread.topic_id)
+    }
+
+    @Test
+    fun threadDetailReadsTopicIdFromObjectArray() {
+        val response = CbdpMapper.threadDetails(
+            emptyList(),
+            command(
+                CbdpMethod.THREAD_READ,
+                listOf(
+                    CbdpTlv(
+                        CbdpTag.OBJECTS,
+                        CbdpCodec.encodeArray(
+                            CbdpTlv(
+                                CbdpTag.OBJECT,
+                                CbdpCodec.encodeTlvs(
+                                    listOf(
+                                        CbdpTlv(CbdpTag.OBJECT_TYPE, CbdpCodec.u8(CbdpMapper.OBJECT_THREAD)),
+                                        CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(9)),
+                                        CbdpTlv(CbdpTag.TOPIC_ID, CbdpCodec.u32(0x10000009)),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("9", response.thread.thread_id)
+        assertEquals(0x10000009L, response.thread.topic_id)
+    }
+
+    @Test
+    fun streamEventKeepsCursorTopicAndScope() {
+        val mapped = CbdpMapper.streamEvent(
+            CbdpEventEnvelope(
+                topicId = 0x10000007,
+                cursor = 4242,
+                eventType = CbdpEvent.MESSAGE_READ,
+                payload = listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(7))),
+                scope = CbdpScope.SUMMARY,
+            ),
+        )
+
+        assertNotNull(mapped)
+        assertEquals(0x10000007L, mapped!!.cbdpTopicId)
+        assertEquals(4242L, mapped.cbdpCursor)
+        assertEquals(CbdpScope.SUMMARY, mapped.cbdpScope)
+    }
+
+    @Test
     fun accountReadCombinesPlanRateLimitsAndTokenUsage() {
         val account = CbdpMapper.accountFromCommands(
             account = command(

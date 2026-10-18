@@ -248,6 +248,15 @@ class ApiClient(
 
     private fun requireThreadRef(threadId: String): Long = CbdpMapper.threadRef(threadId)
 
+    suspend fun acknowledgeEvent(event: StreamEvent) {
+        if (resolveTransport() != Transport.CBDP) return
+        ensureCbdp().acknowledge(
+            topicId = event.cbdpTopicId,
+            cursor = event.cbdpCursor,
+            scope = event.cbdpScope,
+        )
+    }
+
     suspend fun deviceRef(): String {
         ensureCbdp().connect()
         return ensureCbdp().deviceRef.takeIf { it > 0 }?.toString().orEmpty()
@@ -390,7 +399,8 @@ class ApiClient(
     suspend fun models(): ModelsResponse = withCbdpList(
         cbdpCall = {
             val command = execute(CbdpMethod.MODELS_LIST)
-            CbdpMapper.modelsFromCommand(command).takeIf { hasObjectArray(command.result) }
+            val models = CbdpMapper.modelsFromCommand(command)
+            models.takeIf { hasObjectArray(command.result) && models.models.isNotEmpty() }
         },
         companionCall = {
             json.decodeFromString(ModelsResponse.serializer(), getText("/api/companion/models"))
@@ -400,7 +410,8 @@ class ApiClient(
     suspend fun projects(): ProjectsResponse = withCbdpList(
         cbdpCall = {
             val command = execute(CbdpMethod.PROJECTS_LIST)
-            CbdpMapper.projectsFromCommand(command).takeIf { hasObjectArray(command.result) }
+            val projects = CbdpMapper.projectsFromCommand(command)
+            projects.takeIf { hasObjectArray(command.result) && projects.projects.isNotEmpty() }
         },
         companionCall = {
             json.decodeFromString(ProjectsResponse.serializer(), getText("/api/companion/projects"))
@@ -733,7 +744,7 @@ class ApiClient(
         return EventSources.createFactory(client).newEventSource(request, listener)
     }
 
-    fun events(threadId: String? = null): Flow<StreamEvent> = callbackFlow {
+    fun events(threadId: String? = null, topicId: Long? = null): Flow<StreamEvent> = callbackFlow {
         if (resolveTransport() == Transport.COMPANION) {
             val source = companionEvents(
                 threadId = threadId,
@@ -746,14 +757,14 @@ class ApiClient(
             return@callbackFlow
         }
         val client = ensureCbdp()
-        val activeThread = threadId.orEmpty()
-        val threadRef = CbdpMapper.threadRef(activeThread).takeIf { activeThread.isNotBlank() }
+        val activeTopic = topicId?.takeIf { it > 0 }
         val job = launch {
             try {
                 client.subscribe(CbdpTopic.SYSTEM_THREAD_SUMMARIES, CbdpScope.SUMMARY)
-                if (threadRef != null) {
-                    client.subscribe(threadRef, CbdpScope.LIVE)
-                    client.subscribe(threadRef, CbdpScope.THREAD)
+                if (activeTopic != null) {
+                    client.subscribe(activeTopic, CbdpScope.LIVE)
+                    client.subscribe(activeTopic, CbdpScope.THREAD)
+                    client.subscribe(activeTopic, CbdpScope.SUMMARY)
                 }
                 client.events.collect { envelope ->
                     CbdpMapper.streamEvent(envelope)?.let { trySend(it) }
@@ -765,9 +776,9 @@ class ApiClient(
         }
         awaitClose {
             job.cancel()
-            if (threadRef != null) {
+            if (activeTopic != null) {
                 cleanupScope.launch {
-                    runCatching { client.unsubscribeTopics(listOf(threadRef)) }
+                    runCatching { client.unsubscribeTopics(listOf(activeTopic)) }
                 }
             }
         }

@@ -61,6 +61,7 @@ internal object CbdpMapper {
         val activity = tlvs.u64(CbdpTag.LAST_ACTIVITY_AT_MS) ?: 0
         return ThreadSummary(
             thread_id = ref(ref),
+            topic_id = tlvs.u32(CbdpTag.TOPIC_ID) ?: 0,
             title = tlvs.utf8(CbdpTag.TITLE).orEmpty(),
             preview = tlvs.utf8(CbdpTag.SUMMARY).orEmpty(),
             status = threadState(state),
@@ -83,14 +84,16 @@ internal object CbdpMapper {
     }
 
     fun threadDetails(tlvs: List<CbdpTlv>, status: CbdpCommand): ThreadDetailResponse {
-        val thread = threadFromObject(tlvs)
-        val messages = objects(status.result).mapNotNull { objectTlvs ->
+        val resultObjects = objects(status.result)
+        val threadObject = resultObjects.firstOrNull { it.u8(CbdpTag.OBJECT_TYPE) == OBJECT_THREAD }
+        val thread = threadObject?.let(::threadFromObject) ?: threadFromObject(tlvs)
+        val messages = resultObjects.mapNotNull { objectTlvs ->
             when (objectTlvs.u8(CbdpTag.OBJECT_TYPE)) {
                 OBJECT_MESSAGE -> messageFromObject(objectTlvs)
                 else -> null
             }
         }
-        val approvals = objects(status.result).mapNotNull { objectTlvs ->
+        val approvals = resultObjects.mapNotNull { objectTlvs ->
             when (objectTlvs.u8(CbdpTag.OBJECT_TYPE)) {
                 OBJECT_APPROVAL -> approvalFromObject(objectTlvs)
                 else -> null
@@ -465,6 +468,11 @@ internal object CbdpMapper {
             CbdpEvent.DEVICE_OFFLINE -> StreamEvent(type = "stream_error", message = "电脑端连接已断开")
             else -> null
         }
+            ?.copy(
+                cbdpTopicId = event.topicId,
+                cbdpCursor = event.cursor,
+                cbdpScope = event.scope,
+            )
     }
 
     private fun List<CbdpTlv>.tokenTotal(): Long =
@@ -477,13 +485,17 @@ internal object CbdpMapper {
 
     fun objects(tlvs: List<CbdpTlv>): List<List<CbdpTlv>> {
         val array = tlvs.find(CbdpTag.OBJECTS)?.value ?: return emptyList()
-        return decodeArray(array, CbdpTag.OBJECT).mapNotNull { it.tlvOrNull() }
+        return decodeArray(array, CbdpTag.OBJECT)
     }
 
     private fun decodeArray(bytes: ByteArray, expectedTag: Int): List<List<CbdpTlv>> =
         decodeArrayElements(bytes)
             .filter { it.firstOrNull()?.tag == expectedTag }
-            .mapNotNull { it.tlvOrNull() }
+            .mapNotNull { wrapper ->
+                wrapper.firstOrNull()?.value?.let { value ->
+                    runCatching { CbdpCodec.decodeTlvs(value) }.getOrNull()
+                }
+            }
 
     private fun decodeArrayElements(bytes: ByteArray): List<List<CbdpTlv>> {
         if (bytes.size < 2) return emptyList()

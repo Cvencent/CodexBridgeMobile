@@ -416,6 +416,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!foreground || _state.value.screen != AppScreen.Threads) return
         viewModelScope.launch {
             if (!refreshThreads()) refreshConnectionRoute()
+            if (_state.value.models.isEmpty()) loadModels()
+            if (_state.value.projects.isEmpty()) loadProjects()
         }
     }
 
@@ -423,6 +425,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         threadsJob?.cancel()
         if (!foreground || _state.value.screen != AppScreen.Threads) return
         startScreenStream()
+        if (_state.value.models.isEmpty()) loadModels()
+        if (_state.value.projects.isEmpty()) loadProjects()
         threadsJob = viewModelScope.launch {
             routeRefreshJob?.join()
             var attempt = 0
@@ -670,7 +674,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val client = api ?: break
                 var streamFailed = false
                 try {
-                    client.events(threadId).collect { event ->
+                    var topicId = _state.value.activeThread
+                        ?.takeIf { it.thread_id == threadId }
+                        ?.topic_id
+                        ?.takeIf { it > 0 }
+                    if (topicId == null) {
+                        val detail = runCatching { client.thread(threadId) }.getOrNull()
+                        topicId = detail?.thread?.topic_id?.takeIf { it > 0 }
+                        if (topicId != null && detail != null) {
+                            _state.update { state ->
+                                state.copy(
+                                    activeThread = if (state.activeThread?.thread_id == threadId) {
+                                        detail.thread
+                                    } else {
+                                        state.activeThread
+                                    },
+                                    threads = state.threads.map { thread ->
+                                        if (thread.thread_id == threadId) detail.thread else thread
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    client.events(threadId, topicId).collect { event ->
                         if (event.type == "stream_error") {
                             streamFailed = true
                             _state.update { it.copy(connected = false) }
@@ -1082,6 +1108,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     // -------------------------------------------------------------- events
     private fun applyEvent(event: StreamEvent) {
+        try {
+            applyEventBody(event)
+        } finally {
+            if (event.cbdpTopicId > 0 && event.cbdpCursor > 0) {
+                viewModelScope.launch {
+                    runCatching { api?.acknowledgeEvent(event) }
+                }
+            }
+        }
+    }
+
+    private fun applyEventBody(event: StreamEvent) {
         when (event.type) {
             "agent_delta" -> {
                 if (event.item_id.isBlank()) return
