@@ -96,6 +96,7 @@ class CbdpClient(
     private val outbound = linkedMapOf<Long, OutboundFrame>()
     internal val fragments = mutableMapOf<Long, FragmentAssembly>()
     private val subscriptions = linkedMapOf<Pair<Long, Int>, Long>()
+    private val cursors = linkedMapOf<Long, Long>()
     private val _events = MutableSharedFlow<CbdpEventEnvelope>(extraBufferCapacity = 256)
     val events: SharedFlow<CbdpEventEnvelope> = _events.asSharedFlow()
 
@@ -139,7 +140,10 @@ class CbdpClient(
         closed = false
         resetConnectionState()
         val wsUrl = toWebSocketUrl(baseUrl) + "/cbdp/v1/ws"
-        val request = Request.Builder().url(wsUrl).build()
+        val request = Request.Builder()
+            .url(wsUrl)
+            .apply { authHeaders().forEach { (key, value) -> header(key, value) } }
+            .build()
         val ws = withContext(Dispatchers.IO) {
             runCatching { client.newWebSocket(request, webSocketListener()) }.getOrNull()
         }
@@ -169,6 +173,19 @@ class CbdpClient(
         throw CbdpClientException("handshake timed out")
     }
 
+    private suspend fun awaitHttpReady() {
+        repeat((HTTP_AUTH_TIMEOUT_MS / 20).toInt()) {
+            if (session.state == CbdpSessionState.READY) return
+            delay(20)
+        }
+        if (session.state == CbdpSessionState.AUTH_SENT) {
+            session.acceptHttpAuthTimeout()
+        }
+        if (session.state != CbdpSessionState.READY) {
+            throw CbdpClientException("handshake timed out")
+        }
+    }
+
     private fun webSocketListener(): WebSocketListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             socket = webSocket
@@ -196,7 +213,12 @@ class CbdpClient(
         val request = Request.Builder()
             .url(baseUrl.trimEnd('/') + "/cbdp/v1/events")
             .header("Accept", "text/event-stream")
-            .apply { authHeaders().forEach { (key, value) -> header(key, value) } }
+            .apply {
+                authHeaders().forEach { (key, value) -> header(key, value) }
+                synchronized(cursors) { cursors[0L] }
+                    ?.takeIf { it > 0 }
+                    ?.let { header("Last-Event-ID", it.toString()) }
+            }
             .build()
         val listener = object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
@@ -207,6 +229,9 @@ class CbdpClient(
                 if (type != null && type != "cbdp") return
                 if (data.isBlank()) return
                 val bytes = runCatching { Base64.getDecoder().decode(data.trim()) }.getOrNull() ?: return
+                id?.toLongOrNull()?.takeIf { it > 0 }?.let { cursor ->
+                    synchronized(cursors) { cursors[0L] = maxOf(cursors[0L] ?: 0L, cursor) }
+                }
                 receive(bytes)
             }
 
@@ -223,7 +248,7 @@ class CbdpClient(
         sseMode = true
         val source = EventSources.createFactory(client).newEventSource(request, listener)
         sseSource = source
-        withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitReady() }
+        withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitHttpReady() }
     }
 
     private fun receive(bytes: ByteArray) {
@@ -339,12 +364,20 @@ class CbdpClient(
     }
 
     private fun emitDelta(frame: CbdpFrame) {
+        val cursor = frame.tlvs.u64(CbdpTag.GLOBAL_SEQ)
+            ?: frame.tlvs.u64(CbdpTag.CURSOR)
+            ?: frame.header.seq
+        if (cursor > 0) {
+            synchronized(cursors) {
+                cursors[frame.header.topicId] = maxOf(cursors[frame.header.topicId] ?: 0L, cursor)
+            }
+        }
         val eventType = frame.tlvs.u16(CbdpTag.EVENT_TYPE) ?: return
         val payload = frame.tlvs.tlv(CbdpTag.EVENT_PAYLOAD).orEmpty()
         _events.tryEmit(
             CbdpEventEnvelope(
                 topicId = frame.header.topicId,
-                cursor = frame.tlvs.u64(CbdpTag.GLOBAL_SEQ) ?: 0,
+                cursor = cursor,
                 eventType = eventType,
                 payload = payload,
             ),
@@ -648,7 +681,8 @@ class CbdpClient(
         registrations.forEach { (registration, cursor) ->
             val (topicId, scope) = registration
             val requestId = requestIds.incrementAndGet()
-            sendReliable(session.subscribe(topicId, scope, cursor, requestId))
+            val latest = synchronized(cursors) { cursors[topicId] ?: cursor }
+            sendReliable(session.subscribe(topicId, scope, latest, requestId))
         }
     }
 
@@ -706,6 +740,7 @@ class CbdpClient(
 
     companion object {
         private const val HANDSHAKE_TIMEOUT_MS = 12_000L
+        private const val HTTP_AUTH_TIMEOUT_MS = 2_000L
         private const val RECONNECT_DELAY_MS = 1_200L
         private const val RETRANSMIT_TIMEOUT_MS = 1_000L
         private const val MAX_RETRANSMIT_MS = 8_000L

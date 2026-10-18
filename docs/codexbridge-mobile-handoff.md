@@ -56,3 +56,25 @@ Bridge 已在普通 JSON 响应使用 `Connection: close`。当前联调里，Co
 - 手机使用 CBDP-only 客户端连接 `8568`，可以完成 HELLO/WELCOME/AUTH、订阅、线程列表、详情、发送、队列、审批。
 - Bridge 停止/恢复时，SSE/WS 均能及时结束并让客户端按退避恢复。
 - 管理页能看到当前 Companion 端口是否已启用 CBDP v1。
+
+## 5. Companion HTTP CBDP 命令结果缺少对象数组
+
+运行版本：CodexBridge `2.0.4`。
+
+实际验证：
+
+- `/cbdp/v1/ws`、`/cbdp/v1/events`、`POST /cbdp/v1/frame` 均已可用，Bearer 鉴权正常。
+- HELLO/WELCOME/AUTH/AUTH_OK 仍按标准 CBDP 状态机执行；3.1.1 中“不再单独做一次 AUTH”与实际实现不一致。
+- `threads.list` 返回的 RESULT 只有通用短字段，没有协议要求的 `objects` 数组。
+- `thread.read`、`models.list`、`projects.list` 等同样只经过 `_result_fields()` 的通用短字段映射。
+
+影响：
+
+- 手机切换到 CBDP 后，连接和订阅正常，但线程列表、模型列表、项目列表为空。
+- 这会让 UI 显示“0 个任务”，而不是协议错误。
+
+建议 Bridge 侧处理：
+
+- 在 `CbdpGateway._handle_command()` 的结果路径按方法实现协议 17.1.1 的 RESULT schema。
+- 至少补齐 `threads.list`、`thread.read`、`models.list`、`projects.list` 的 `objects` / `next_cursor` / `object_count` 编码。
+- 明确 3.1.1 与当前 HTTP CBDP 状态机的鉴权语义：要么实现 WELCOME 后免 AUTH，要么修订文档说明 HTTP CBDP 仍需 AUTH。

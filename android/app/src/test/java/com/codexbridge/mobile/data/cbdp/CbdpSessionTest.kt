@@ -62,6 +62,18 @@ class CbdpSessionTest {
     }
 
     @Test
+    fun httpBearerSessionCanBecomeReadyAfterWelcomeWithoutAuthOk() {
+        val session = newSession()
+        session.start()
+        val auth = session.accept(welcomeFrame()).single()
+        assertEquals(CbdpMessageType.AUTH, auth.header.messageType)
+        assertEquals(CbdpSessionState.AUTH_SENT, session.state)
+
+        session.acceptHttpAuthTimeout()
+        assertEquals(CbdpSessionState.READY, session.state)
+    }
+
+    @Test
     fun respondsToPingWithMatchingEcho() {
         val session = newSession()
         helloToReady(session)

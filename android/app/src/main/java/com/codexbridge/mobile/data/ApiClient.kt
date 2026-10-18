@@ -204,7 +204,7 @@ class ApiClient(
             cbdpCall()
         } catch (error: CbdpClientException) {
             if (error.unauthorized || error.code == CbdpErrorCode.NOT_FOUND) {
-                transport = Transport.COMPANION
+                fallBackToCompanion()
                 companionCall()
             } else {
                 throw error
@@ -212,6 +212,39 @@ class ApiClient(
         }
         Transport.COMPANION -> companionCall()
         Transport.UNKNOWN -> error("transport not resolved")
+    }
+
+    private suspend fun <T : Any> withCbdpList(
+        cbdpCall: suspend () -> T?,
+        companionCall: suspend () -> T,
+    ): T = when (resolveTransport()) {
+        Transport.CBDP -> try {
+            cbdpCall() ?: run {
+                // Bridge 2.0.4 exposes CBDP HTTP routes but its generic command
+                // result bridge does not yet encode object arrays. Keep the UI
+                // usable with the legacy companion data until that is complete.
+                fallBackToCompanion()
+                companionCall()
+            }
+        } catch (error: CbdpClientException) {
+            if (error.unauthorized || error.code == CbdpErrorCode.NOT_FOUND) {
+                fallBackToCompanion()
+                companionCall()
+            } else {
+                throw error
+            }
+        }
+        Transport.COMPANION -> companionCall()
+        Transport.UNKNOWN -> error("transport not resolved")
+    }
+
+    private fun hasObjectArray(tlvs: List<CbdpTlv>): Boolean =
+        tlvs.any { it.tag and 0xFFFF == CbdpTag.OBJECTS }
+
+    private fun fallBackToCompanion() {
+        transport = Transport.COMPANION
+        cbdp?.close()
+        cbdp = null
     }
 
     private suspend fun execute(methodId: Int, params: List<CbdpTlv> = emptyList()): CbdpCommand =
@@ -262,14 +295,16 @@ class ApiClient(
         companionCall = { status().account },
     )
 
-    suspend fun threads(search: String = ""): ThreadsResponse = withTransport(
+    suspend fun threads(search: String = ""): ThreadsResponse = withCbdpList(
         cbdpCall = {
             val params = mutableListOf<CbdpTlv>()
             if (search.isNotBlank()) {
                 params += CbdpTlv(CbdpTag.SEARCH_SCOPE, CbdpCodec.u8(0))
                 params += CbdpTlv(CbdpTag.TITLE, search.toByteArray())
             }
-            CbdpMapper.threadsFromCommand(execute(CbdpMethod.THREADS_LIST, params))
+            val command = execute(CbdpMethod.THREADS_LIST, params)
+            val result = CbdpMapper.threadsFromCommand(command)
+            result.takeIf { hasObjectArray(command.result) }
         },
         companionCall = {
             val query = if (search.isBlank()) "" else "?search=" + java.net.URLEncoder.encode(search, "UTF-8")
@@ -331,15 +366,21 @@ class ApiClient(
         )
     }
 
-    suspend fun models(): ModelsResponse = withTransport(
-        cbdpCall = { CbdpMapper.modelsFromCommand(execute(CbdpMethod.MODELS_LIST)) },
+    suspend fun models(): ModelsResponse = withCbdpList(
+        cbdpCall = {
+            val command = execute(CbdpMethod.MODELS_LIST)
+            CbdpMapper.modelsFromCommand(command).takeIf { hasObjectArray(command.result) }
+        },
         companionCall = {
             json.decodeFromString(ModelsResponse.serializer(), getText("/api/companion/models"))
         },
     )
 
-    suspend fun projects(): ProjectsResponse = withTransport(
-        cbdpCall = { CbdpMapper.projectsFromCommand(execute(CbdpMethod.PROJECTS_LIST)) },
+    suspend fun projects(): ProjectsResponse = withCbdpList(
+        cbdpCall = {
+            val command = execute(CbdpMethod.PROJECTS_LIST)
+            CbdpMapper.projectsFromCommand(command).takeIf { hasObjectArray(command.result) }
+        },
         companionCall = {
             json.decodeFromString(ProjectsResponse.serializer(), getText("/api/companion/projects"))
         },
