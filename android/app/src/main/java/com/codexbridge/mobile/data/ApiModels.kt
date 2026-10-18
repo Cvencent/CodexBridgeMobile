@@ -17,6 +17,28 @@ data class PingResponse(
     val port: Int = 0,
     val discovery_port: Int = 0,
     val requires_pairing: Boolean = false,
+    @SerialName("cbdp_v1") val cbdpV1: CbdpCapability? = null,
+)
+
+@Serializable
+data class CbdpCapability(
+    val protocol: String = "",
+    val version: String = "",
+    @SerialName("version_major") val versionMajor: Int = 0,
+    @SerialName("version_minor") val versionMinor: Int = 0,
+    val transport: String = "",
+    val paths: CbdpPaths = CbdpPaths(),
+    val auth: String = "",
+    @SerialName("auth_mode") val authMode: Int = 0,
+    val enabled: Boolean = false,
+    val port: Int = 0,
+)
+
+@Serializable
+data class CbdpPaths(
+    val websocket: String = "/cbdp/v1/ws",
+    val events: String = "/cbdp/v1/events",
+    val frame: String = "/cbdp/v1/frame",
 )
 
 @Serializable

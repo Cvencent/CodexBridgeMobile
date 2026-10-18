@@ -403,18 +403,6 @@ class CbdpSession(
         if (state != CbdpSessionState.READY) throw CbdpSessionException("session is not ready")
     }
 
-    /**
-     * 3.1.1 permits HTTP Companion clients to use the Bearer-authenticated
-     * transport without a separate CBDP AUTH. Bridge 2.0.4 still answers the
-     * AUTH frame, so accept a short AUTH_OK grace period and otherwise treat
-     * the already-authenticated HTTP session as ready.
-     */
-    fun acceptHttpAuthTimeout() {
-        if (state == CbdpSessionState.AUTH_SENT) {
-            state = CbdpSessionState.READY
-        }
-    }
-
     private fun canonicalizeParams(params: ByteArray): ByteArray {
         val decoded = CbdpCodec.decodeTlvs(params)
         val sorted = decoded.sortedWith(

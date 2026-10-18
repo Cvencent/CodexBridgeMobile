@@ -173,19 +173,6 @@ class CbdpClient(
         throw CbdpClientException("handshake timed out")
     }
 
-    private suspend fun awaitHttpReady() {
-        repeat((HTTP_AUTH_TIMEOUT_MS / 20).toInt()) {
-            if (session.state == CbdpSessionState.READY) return
-            delay(20)
-        }
-        if (session.state == CbdpSessionState.AUTH_SENT) {
-            session.acceptHttpAuthTimeout()
-        }
-        if (session.state != CbdpSessionState.READY) {
-            throw CbdpClientException("handshake timed out")
-        }
-    }
-
     private fun webSocketListener(): WebSocketListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             socket = webSocket
@@ -248,7 +235,7 @@ class CbdpClient(
         sseMode = true
         val source = EventSources.createFactory(client).newEventSource(request, listener)
         sseSource = source
-        withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitHttpReady() }
+        withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitReady() }
     }
 
     private fun receive(bytes: ByteArray) {
@@ -740,7 +727,6 @@ class CbdpClient(
 
     companion object {
         private const val HANDSHAKE_TIMEOUT_MS = 12_000L
-        private const val HTTP_AUTH_TIMEOUT_MS = 2_000L
         private const val RECONNECT_DELAY_MS = 1_200L
         private const val RETRANSMIT_TIMEOUT_MS = 1_000L
         private const val MAX_RETRANSMIT_MS = 8_000L

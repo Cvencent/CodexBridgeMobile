@@ -178,22 +178,13 @@ class ApiClient(
         }
     }
 
-    private suspend fun probeCbdp(): Boolean = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url(url("/cbdp/v1/ws"))
-            .header("Authorization", "Bearer ${token.orEmpty()}")
-            .header("Connection", "close")
-            .get()
-            .build()
-        runCatching {
-            probeClient.newCall(request).execute().use { response -> response.code }
-        }.getOrNull()?.let { code ->
-            // A normal GET against a WebSocket endpoint is rejected as an
-            // upgrade/HTTP-method error when the route exists. The legacy
-            // companion server answers 401/403/404 because it owns the port but
-            // does not expose CBDP.
-            code !in setOf(401, 403, 404)
-        } ?: false
+    private suspend fun probeCbdp(): Boolean {
+        val direct = runCatching {
+            json.decodeFromString(CbdpCapability.serializer(), getText("/cbdp/v1"))
+        }.getOrNull()
+        if (direct?.enabled == true && direct.versionMajor >= 1) return true
+        val ping = runCatching { ping() }.getOrNull()
+        return ping?.cbdpV1?.enabled == true && (ping.cbdpV1?.versionMajor ?: 0) >= 1
     }
 
     private suspend fun <T> withTransport(
@@ -296,21 +287,33 @@ class ApiClient(
     )
 
     suspend fun threads(search: String = ""): ThreadsResponse = withCbdpList(
-        cbdpCall = {
-            val params = mutableListOf<CbdpTlv>()
-            if (search.isNotBlank()) {
-                params += CbdpTlv(CbdpTag.SEARCH_SCOPE, CbdpCodec.u8(0))
-                params += CbdpTlv(CbdpTag.TITLE, search.toByteArray())
-            }
-            val command = execute(CbdpMethod.THREADS_LIST, params)
-            val result = CbdpMapper.threadsFromCommand(command)
-            result.takeIf { hasObjectArray(command.result) }
-        },
+        cbdpCall = { cbdpThreads(search) },
         companionCall = {
             val query = if (search.isBlank()) "" else "?search=" + java.net.URLEncoder.encode(search, "UTF-8")
             json.decodeFromString(ThreadsResponse.serializer(), getText("/api/companion/threads$query"))
         },
     )
+
+    private suspend fun cbdpThreads(search: String): ThreadsResponse? {
+        val collected = mutableListOf<com.codexbridge.mobile.data.ThreadSummary>()
+        var cursor = 0L
+        var guard = 0
+        do {
+            val params = mutableListOf<CbdpTlv>()
+            if (search.isNotBlank()) {
+                params += CbdpTlv(CbdpTag.SEARCH_SCOPE, CbdpCodec.u8(0))
+                params += CbdpTlv(CbdpTag.TITLE, search.toByteArray())
+            }
+            if (cursor > 0) params += CbdpTlv(CbdpTag.CURSOR, CbdpCodec.u64(cursor))
+            val command = execute(CbdpMethod.THREADS_LIST, params)
+            if (!hasObjectArray(command.result)) return null
+            val page = CbdpMapper.threadsFromCommand(command)
+            collected += page.threads
+            cursor = command.result.u64(CbdpTag.NEXT_CURSOR) ?: 0L
+            guard += 1
+        } while (cursor > 0 && guard < MAX_LIST_PAGES)
+        return ThreadsResponse(ok = true, threads = collected)
+    }
 
     suspend fun thread(threadId: String): ThreadDetailResponse = withTransport(
         cbdpCall = { cbdpThread(threadId) },
@@ -324,10 +327,7 @@ class ApiClient(
 
     private suspend fun cbdpThread(threadId: String): ThreadDetailResponse {
         val threadRef = requireThreadRef(threadId)
-        val detail = CbdpMapper.threadDetails(
-            emptyList(),
-            execute(CbdpMethod.THREAD_READ, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(threadRef)))),
-        )
+        val detail = cbdpReadDetail(threadRef)
         val loadedMessages = detail.messages.map { message ->
             val bodyRef = message.detail.body_ref
             if (bodyRef.isBlank()) return@map message
@@ -364,6 +364,27 @@ class ApiClient(
             task = detail.task,
             queue = detail.queue.copy(items = detail.queue.items),
         )
+    }
+
+    private suspend fun cbdpReadDetail(threadRef: Long): ThreadDetailResponse {
+        val messages = mutableListOf<com.codexbridge.mobile.data.MessageItem>()
+        var cursor = 0L
+        var guard = 0
+        var first: ThreadDetailResponse? = null
+        do {
+            val params = mutableListOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(threadRef)))
+            if (cursor > 0) params += CbdpTlv(CbdpTag.CURSOR, CbdpCodec.u64(cursor))
+            val command = execute(CbdpMethod.THREAD_READ, params)
+            val page = CbdpMapper.threadDetails(command.result, command)
+            if (first == null) {
+                first = page
+            }
+            messages += page.messages
+            cursor = command.result.u64(CbdpTag.NEXT_CURSOR) ?: 0L
+            guard += 1
+        } while (cursor > 0 && guard < MAX_LIST_PAGES)
+        val base = first ?: throw ApiException("thread.read returned no detail", "invalid_command_result")
+        return base.copy(messages = messages, message_count = messages.size)
     }
 
     suspend fun models(): ModelsResponse = withCbdpList(
@@ -759,6 +780,7 @@ class ApiClient(
         private const val LEGACY_COMPANION_PORT = 8791
         private const val LEGACY_DISCOVERY_PORT = 8766
         private const val MAX_CONTENT_READ_PAGES = 4096
+        private const val MAX_LIST_PAGES = 128
 
         internal fun commandPayload(text: String): String {
             val envelope = Json.parseToJsonElement(text).jsonObject
