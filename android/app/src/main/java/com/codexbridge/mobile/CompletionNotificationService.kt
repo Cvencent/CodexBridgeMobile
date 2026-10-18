@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.app.ActivityManager
 import android.media.RingtoneManager
 import android.media.AudioManager
 import android.provider.Settings
@@ -34,12 +35,12 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 private const val LISTEN_CHANNEL = "codexbridge_listen"
 private const val COMPLETION_CHANNEL = "codexbridge_completion_v5"
 private const val LISTEN_NOTIFICATION_ID = 4101
-private const val RETRY_MS = 3000L
-private const val POLL_MS = 5000L
+private const val POLL_MS = 30_000L
 
 class CompletionNotificationService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -48,6 +49,7 @@ class CompletionNotificationService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private lateinit var completions: CompletionNotificationTracker
     private var baselineReady = false
+    @Volatile private var cachedClient: ApiClient? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -78,6 +80,7 @@ class CompletionNotificationService : Service() {
         job?.cancel()
         scope.cancel()
         releaseConnectionLocks()
+        cachedClient = null
         super.onDestroy()
     }
 
@@ -160,6 +163,7 @@ class CompletionNotificationService : Service() {
     }
 
     private suspend fun clientFor(settings: SettingsStore): ApiClient {
+        cachedClient?.let { return it }
         val candidates = ConnectionRoute.candidatesFor(
             legacyUrl = settings.baseUrl,
             lanUrl = settings.lanUrl,
@@ -172,9 +176,9 @@ class CompletionNotificationService : Service() {
         if (selected != null) {
             settings.lastSuccessfulUrl = selected.url
             settings.baseUrl = selected.url
-            return ApiClient(selected.url, settings.token, settings.phoneId)
+            return ApiClient(selected.url, settings.token, settings.phoneId).also { cachedClient = it }
         }
-        return ApiClient(settings.baseUrl, settings.token, settings.phoneId)
+        return ApiClient(settings.baseUrl, settings.token, settings.phoneId).also { cachedClient = it }
     }
 
     private fun isOnWifi(): Boolean {
@@ -205,9 +209,20 @@ class CompletionNotificationService : Service() {
         completions: CompletionNotificationTracker,
     ) {
         while (scope.isActive) {
+            if (isAppForeground()) {
+                delay(2_000L)
+                continue
+            }
+            var attempt = 0
             try {
                 val client = clientFor(settings)
+                var streamFailed = false
                 client.events().collect { event ->
+                    if (event.type == "stream_error") {
+                        streamFailed = true
+                        return@collect
+                    }
+                    attempt = 0
                     when (event.type) {
                         "turn_completed" -> {
                             if (event.thread_id.isBlank()) return@collect
@@ -248,9 +263,13 @@ class CompletionNotificationService : Service() {
                         }
                     }
                 }
-                delay(RETRY_MS)
+                if (streamFailed) cachedClient = null
+                attempt += 1
+                delay(backoffMillis(attempt))
             } catch (_: Exception) {
-                delay(RETRY_MS)
+                cachedClient = null
+                attempt += 1
+                delay(backoffMillis(attempt))
             }
         }
     }
@@ -263,11 +282,14 @@ class CompletionNotificationService : Service() {
         settings: SettingsStore,
         completions: CompletionNotificationTracker,
     ) {
+        var attempt = 0
         while (scope.isActive) {
             delay(POLL_MS)
+            if (isAppForeground()) continue
             try {
                 val client = clientFor(settings)
                 val threads = client.threads().threads
+                attempt = 0
                 if (!baselineReady) {
                     // The first snapshot is history, not a completion. If the
                     // service started while offline, establish the baseline on
@@ -287,9 +309,19 @@ class CompletionNotificationService : Service() {
                     }
                 }
             } catch (_: Exception) {
-                // Keep polling; the SSE listener reports connection issues.
+                cachedClient = null
+                attempt += 1
+                delay(backoffMillis(attempt))
             }
         }
+    }
+
+    private fun isAppForeground(): Boolean {
+        val manager = getSystemService(ActivityManager::class.java) ?: return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return manager.appTasks.any { it.taskInfo.topActivity?.packageName == packageName }
+        }
+        return false
     }
 
     private fun notifyCompletion(threadId: String, failed: Boolean, completedAt: Long) {
@@ -356,6 +388,11 @@ class CompletionNotificationService : Service() {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
     }
+}
+
+private fun backoffMillis(attempt: Int): Long {
+    val base = (2_000L shl attempt.coerceIn(0, 5)).coerceAtMost(60_000L)
+    return base + Random.nextLong(0L, 1_000L)
 }
 
 private fun completionId(threadId: String): Int =

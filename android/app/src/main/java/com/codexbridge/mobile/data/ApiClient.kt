@@ -2,6 +2,7 @@ package com.codexbridge.mobile.data
 
 import com.codexbridge.mobile.data.cbdp.CbdpApprovalDecision
 import com.codexbridge.mobile.data.cbdp.CbdpClient
+import com.codexbridge.mobile.data.cbdp.CbdpClientException
 import com.codexbridge.mobile.data.cbdp.CbdpCommand
 import com.codexbridge.mobile.data.cbdp.CbdpErrorCode
 import com.codexbridge.mobile.data.cbdp.CbdpMapper
@@ -25,6 +26,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -70,6 +73,17 @@ class ApiClient(
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
+
+    private val probeClient = client.newBuilder()
+        .readTimeout(3, TimeUnit.SECONDS)
+        .build()
+
+    private enum class Transport { UNKNOWN, CBDP, COMPANION }
+
+    private val transportLock = Mutex()
+
+    @Volatile
+    private var transport: Transport = Transport.UNKNOWN
 
     @Volatile
     private var cbdp: CbdpClient? = null
@@ -120,6 +134,18 @@ class ApiClient(
             ),
         )
 
+    private suspend fun command(method: String, params: JsonObject): String =
+        commandPayload(
+            postText(
+                "/api/companion/commands",
+                buildJsonObject {
+                    put("request_id", java.util.UUID.randomUUID().toString())
+                    put("method", method)
+                    put("params", params)
+                },
+            ),
+        )
+
     private fun ensureCbdp(): CbdpClient {
         val current = cbdp
         if (current != null) return current
@@ -135,6 +161,57 @@ class ApiClient(
             cbdp = created
             return created
         }
+    }
+
+    val supportsWriterLease: Boolean
+        get() = transport != Transport.COMPANION
+
+    private suspend fun resolveTransport(): Transport {
+        val known = transport
+        if (known != Transport.UNKNOWN) return known
+        return transportLock.withLock {
+            val current = transport
+            if (current != Transport.UNKNOWN) return@withLock current
+            val detected = if (probeCbdp()) Transport.CBDP else Transport.COMPANION
+            transport = detected
+            detected
+        }
+    }
+
+    private suspend fun probeCbdp(): Boolean = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(url("/cbdp/v1/ws"))
+            .header("Authorization", "Bearer ${token.orEmpty()}")
+            .header("Connection", "close")
+            .get()
+            .build()
+        runCatching {
+            probeClient.newCall(request).execute().use { response -> response.code }
+        }.getOrNull()?.let { code ->
+            // A normal GET against a WebSocket endpoint is rejected as an
+            // upgrade/HTTP-method error when the route exists. The legacy
+            // companion server answers 401/403/404 because it owns the port but
+            // does not expose CBDP.
+            code !in setOf(401, 403, 404)
+        } ?: false
+    }
+
+    private suspend fun <T> withTransport(
+        cbdpCall: suspend () -> T,
+        companionCall: suspend () -> T,
+    ): T = when (resolveTransport()) {
+        Transport.CBDP -> try {
+            cbdpCall()
+        } catch (error: CbdpClientException) {
+            if (error.unauthorized || error.code == CbdpErrorCode.NOT_FOUND) {
+                transport = Transport.COMPANION
+                companionCall()
+            } else {
+                throw error
+            }
+        }
+        Transport.COMPANION -> companionCall()
+        Transport.UNKNOWN -> error("transport not resolved")
     }
 
     private suspend fun execute(methodId: Int, params: List<CbdpTlv> = emptyList()): CbdpCommand =
@@ -168,28 +245,49 @@ class ApiClient(
             ),
         )
 
-    suspend fun status(): StatusResponse {
-        val status = execute(CbdpMethod.STATUS_READ)
-        return CbdpMapper.statusFromCommand(status)
-    }
+    suspend fun status(): StatusResponse = withTransport(
+        cbdpCall = { CbdpMapper.statusFromCommand(execute(CbdpMethod.STATUS_READ)) },
+        companionCall = {
+            json.decodeFromString(StatusResponse.serializer(), getText("/api/companion/status"))
+        },
+    )
 
-    suspend fun account(): Account {
-        val account = execute(CbdpMethod.ACCOUNT_READ)
-        val rateLimits = runCatching { execute(CbdpMethod.ACCOUNT_RATE_LIMITS_READ) }.getOrNull()
-        val tokenUsage = runCatching { execute(CbdpMethod.ACCOUNT_TOKEN_USAGE_READ) }.getOrNull()
-        return CbdpMapper.accountFromCommands(account, rateLimits, tokenUsage)
-    }
+    suspend fun account(): Account = withTransport(
+        cbdpCall = {
+            val account = execute(CbdpMethod.ACCOUNT_READ)
+            val rateLimits = runCatching { execute(CbdpMethod.ACCOUNT_RATE_LIMITS_READ) }.getOrNull()
+            val tokenUsage = runCatching { execute(CbdpMethod.ACCOUNT_TOKEN_USAGE_READ) }.getOrNull()
+            CbdpMapper.accountFromCommands(account, rateLimits, tokenUsage)
+        },
+        companionCall = { status().account },
+    )
 
-    suspend fun threads(search: String = ""): ThreadsResponse {
-        val params = mutableListOf<CbdpTlv>()
-        if (search.isNotBlank()) {
-            params += CbdpTlv(CbdpTag.SEARCH_SCOPE, CbdpCodec.u8(0))
-            params += CbdpTlv(CbdpTag.TITLE, search.toByteArray())
-        }
-        return CbdpMapper.threadsFromCommand(execute(CbdpMethod.THREADS_LIST, params))
-    }
+    suspend fun threads(search: String = ""): ThreadsResponse = withTransport(
+        cbdpCall = {
+            val params = mutableListOf<CbdpTlv>()
+            if (search.isNotBlank()) {
+                params += CbdpTlv(CbdpTag.SEARCH_SCOPE, CbdpCodec.u8(0))
+                params += CbdpTlv(CbdpTag.TITLE, search.toByteArray())
+            }
+            CbdpMapper.threadsFromCommand(execute(CbdpMethod.THREADS_LIST, params))
+        },
+        companionCall = {
+            val query = if (search.isBlank()) "" else "?search=" + java.net.URLEncoder.encode(search, "UTF-8")
+            json.decodeFromString(ThreadsResponse.serializer(), getText("/api/companion/threads$query"))
+        },
+    )
 
-    suspend fun thread(threadId: String): ThreadDetailResponse {
+    suspend fun thread(threadId: String): ThreadDetailResponse = withTransport(
+        cbdpCall = { cbdpThread(threadId) },
+        companionCall = {
+            json.decodeFromString(
+                ThreadDetailResponse.serializer(),
+                getText("/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8")),
+            )
+        },
+    )
+
+    private suspend fun cbdpThread(threadId: String): ThreadDetailResponse {
         val threadRef = requireThreadRef(threadId)
         val detail = CbdpMapper.threadDetails(
             emptyList(),
@@ -233,11 +331,37 @@ class ApiClient(
         )
     }
 
-    suspend fun models(): ModelsResponse = CbdpMapper.modelsFromCommand(execute(CbdpMethod.MODELS_LIST))
+    suspend fun models(): ModelsResponse = withTransport(
+        cbdpCall = { CbdpMapper.modelsFromCommand(execute(CbdpMethod.MODELS_LIST)) },
+        companionCall = {
+            json.decodeFromString(ModelsResponse.serializer(), getText("/api/companion/models"))
+        },
+    )
 
-    suspend fun projects(): ProjectsResponse = CbdpMapper.projectsFromCommand(execute(CbdpMethod.PROJECTS_LIST))
+    suspend fun projects(): ProjectsResponse = withTransport(
+        cbdpCall = { CbdpMapper.projectsFromCommand(execute(CbdpMethod.PROJECTS_LIST)) },
+        companionCall = {
+            json.decodeFromString(ProjectsResponse.serializer(), getText("/api/companion/projects"))
+        },
+    )
 
-    suspend fun createThread(cwd: String, model: String): CreateThreadResponse {
+    suspend fun createThread(cwd: String, model: String): CreateThreadResponse = withTransport(
+        cbdpCall = { cbdpCreateThread(cwd, model) },
+        companionCall = {
+            json.decodeFromString(
+                CreateThreadResponse.serializer(),
+                postText(
+                    "/api/companion/threads",
+                    buildJsonObject {
+                        put("cwd", cwd)
+                        put("model", model)
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpCreateThread(cwd: String, model: String): CreateThreadResponse {
         val params = mutableListOf<CbdpTlv>()
         if (cwd.isNotBlank()) params += CbdpTlv(CbdpTag.CWD, cwd.toByteArray())
         if (model.isNotBlank()) params += CbdpTlv(CbdpTag.MODEL_NAME, model.toByteArray())
@@ -249,6 +373,29 @@ class ApiClient(
         text: String,
         model: String = "",
         effort: String = "",
+    ): SendResponse = withTransport(
+        cbdpCall = { cbdpSendMessage(threadId, text, model, effort) },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                postText(
+                    "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/messages",
+                    buildJsonObject {
+                        put("text", text)
+                        put("model", model)
+                        put("effort", effort)
+                        put("mode", "start")
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpSendMessage(
+        threadId: String,
+        text: String,
+        model: String,
+        effort: String,
     ): SendResponse {
         val txId = (System.nanoTime() / 1_000_000L).coerceAtLeast(1)
         val command = ensureCbdp().sendText(
@@ -261,17 +408,49 @@ class ApiClient(
         return CbdpMapper.sendResponse(command, threadId)
     }
 
-    suspend fun queue(threadId: String): QueueResponse =
-        CbdpMapper.queueFromCommand(
-            execute(CbdpMethod.QUEUE_LIST, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))),
-            threadId,
-        )
+    suspend fun queue(threadId: String): QueueResponse = withTransport(
+        cbdpCall = {
+            CbdpMapper.queueFromCommand(
+                execute(CbdpMethod.QUEUE_LIST, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))),
+                threadId,
+            )
+        },
+        companionCall = {
+            json.decodeFromString(
+                QueueResponse.serializer(),
+                command("queue.list", buildJsonObject { put("thread_id", threadId) }),
+            )
+        },
+    )
 
     suspend fun enqueueMessage(
         threadId: String,
         text: String,
         model: String = "",
         effort: String = "",
+    ): SendResponse = withTransport(
+        cbdpCall = { cbdpEnqueueMessage(threadId, text, model, effort) },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                command(
+                    "queue.enqueue",
+                    buildJsonObject {
+                        put("thread_id", threadId)
+                        put("text", text)
+                        if (model.isNotBlank()) put("model", model)
+                        if (effort.isNotBlank()) put("effort", effort)
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpEnqueueMessage(
+        threadId: String,
+        text: String,
+        model: String,
+        effort: String,
     ): SendResponse {
         val params = mutableListOf(
             CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))),
@@ -282,7 +461,23 @@ class ApiClient(
         return CbdpMapper.sendResponse(execute(CbdpMethod.QUEUE_ADD, params), threadId)
     }
 
-    suspend fun steerQueue(queueId: String, expectedRevision: Long): SendResponse {
+    suspend fun steerQueue(queueId: String, expectedRevision: Long): SendResponse = withTransport(
+        cbdpCall = { cbdpSteerQueue(queueId, expectedRevision) },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                command(
+                    "queue.steer",
+                    buildJsonObject {
+                        put("queue_id", queueId)
+                        put("expected_revision", expectedRevision)
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpSteerQueue(queueId: String, expectedRevision: Long): SendResponse {
         val params = mutableListOf(
             CbdpTlv(CbdpTag.QUEUE_ITEM_REF, CbdpCodec.u32(queueId.toLongOrNull() ?: CbdpMapper.stableRef(queueId))),
         )
@@ -296,6 +491,31 @@ class ApiClient(
         expectedRevision: Long,
         model: String = "",
         effort: String = "",
+    ): SendResponse = withTransport(
+        cbdpCall = { cbdpEditQueue(queueId, text, expectedRevision, model, effort) },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                command(
+                    "queue.edit",
+                    buildJsonObject {
+                        put("queue_id", queueId)
+                        put("text", text)
+                        put("expected_revision", expectedRevision)
+                        if (model.isNotBlank()) put("model", model)
+                        if (effort.isNotBlank()) put("effort", effort)
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpEditQueue(
+        queueId: String,
+        text: String,
+        expectedRevision: Long,
+        model: String,
+        effort: String,
     ): SendResponse {
         val params = mutableListOf(
             CbdpTlv(CbdpTag.QUEUE_ITEM_REF, CbdpCodec.u32(queueId.toLongOrNull() ?: CbdpMapper.stableRef(queueId))),
@@ -307,7 +527,23 @@ class ApiClient(
         return CbdpMapper.sendResponse(execute(CbdpMethod.QUEUE_UPDATE, params), "")
     }
 
-    suspend fun deleteQueue(queueId: String, expectedRevision: Long): SendResponse {
+    suspend fun deleteQueue(queueId: String, expectedRevision: Long): SendResponse = withTransport(
+        cbdpCall = { cbdpDeleteQueue(queueId, expectedRevision) },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                command(
+                    "queue.delete",
+                    buildJsonObject {
+                        put("queue_id", queueId)
+                        put("expected_revision", expectedRevision)
+                    },
+                ),
+            )
+        },
+    )
+
+    private suspend fun cbdpDeleteQueue(queueId: String, expectedRevision: Long): SendResponse {
         val params = mutableListOf(
             CbdpTlv(CbdpTag.QUEUE_ITEM_REF, CbdpCodec.u32(queueId.toLongOrNull() ?: CbdpMapper.stableRef(queueId))),
         )
@@ -315,38 +551,77 @@ class ApiClient(
         return CbdpMapper.sendResponse(execute(CbdpMethod.QUEUE_DELETE, params), "")
     }
 
-    suspend fun markThreadRead(threadId: String): SendResponse =
-        CbdpMapper.sendResponse(
-            execute(CbdpMethod.THREAD_READ_STATE_UPDATE, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))),
-            threadId,
-        )
-
-    suspend fun claimThread(threadId: String, force: Boolean = false): ActionResponse {
-        val command = ensureCbdp().claimThread(requireThreadRef(threadId), force)
-        return CbdpMapper.actionResponse(command)
-    }
-
-    suspend fun releaseThread(threadId: String, leaseGeneration: Long): ActionResponse {
-        val command = ensureCbdp().releaseThread(requireThreadRef(threadId), leaseGeneration)
-        return CbdpMapper.actionResponse(command)
-    }
-
-    suspend fun interrupt(threadId: String, turnId: String = ""): SendResponse {
-        val params = mutableListOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))
-        turnId.toLongOrNull()?.takeIf { it > 0 }?.let { params += CbdpTlv(CbdpTag.TURN_REF, CbdpCodec.u32(it)) }
-        return CbdpMapper.sendResponse(execute(CbdpMethod.TURN_INTERRUPT, params), threadId)
-    }
-
-    suspend fun resolveApproval(requestId: Int, decision: String): ActionResponse =
-        CbdpMapper.actionResponse(
-            execute(
-                CbdpMethod.APPROVAL_RESOLVE,
-                listOf(
-                    CbdpTlv(CbdpTag.APPROVAL_REF, CbdpCodec.u32(requestId.toLong())),
-                    CbdpTlv(CbdpTag.DECISION, CbdpCodec.u8(decisionValue(decision))),
+    suspend fun markThreadRead(threadId: String): SendResponse = withTransport(
+        cbdpCall = {
+            CbdpMapper.sendResponse(
+                execute(CbdpMethod.THREAD_READ_STATE_UPDATE, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))),
+                threadId,
+            )
+        },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                postText(
+                    "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/read",
+                    buildJsonObject { },
                 ),
-            ),
-        )
+            )
+        },
+    )
+
+    suspend fun claimThread(threadId: String, force: Boolean = false): ActionResponse = withTransport(
+        cbdpCall = {
+            CbdpMapper.actionResponse(ensureCbdp().claimThread(requireThreadRef(threadId), force))
+        },
+        companionCall = { ActionResponse(ok = true, resolved = true) },
+    )
+
+    suspend fun releaseThread(threadId: String, leaseGeneration: Long): ActionResponse = withTransport(
+        cbdpCall = {
+            CbdpMapper.actionResponse(ensureCbdp().releaseThread(requireThreadRef(threadId), leaseGeneration))
+        },
+        companionCall = { ActionResponse(ok = true, resolved = true) },
+    )
+
+    suspend fun interrupt(threadId: String, turnId: String = ""): SendResponse = withTransport(
+        cbdpCall = {
+            val params = mutableListOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))
+            turnId.toLongOrNull()?.takeIf { it > 0 }?.let { params += CbdpTlv(CbdpTag.TURN_REF, CbdpCodec.u32(it)) }
+            CbdpMapper.sendResponse(execute(CbdpMethod.TURN_INTERRUPT, params), threadId)
+        },
+        companionCall = {
+            json.decodeFromString(
+                SendResponse.serializer(),
+                postText(
+                    "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/interrupt",
+                    buildJsonObject { put("turn_id", turnId) },
+                ),
+            )
+        },
+    )
+
+    suspend fun resolveApproval(requestId: Int, decision: String): ActionResponse = withTransport(
+        cbdpCall = {
+            CbdpMapper.actionResponse(
+                execute(
+                    CbdpMethod.APPROVAL_RESOLVE,
+                    listOf(
+                        CbdpTlv(CbdpTag.APPROVAL_REF, CbdpCodec.u32(requestId.toLong())),
+                        CbdpTlv(CbdpTag.DECISION, CbdpCodec.u8(decisionValue(decision))),
+                    ),
+                ),
+            )
+        },
+        companionCall = {
+            json.decodeFromString(
+                ActionResponse.serializer(),
+                postText(
+                    "/api/companion/approvals/$requestId",
+                    buildJsonObject { put("decision", decision) },
+                ),
+            )
+        },
+    )
 
     suspend fun respondApproval(requestId: Int, response: JsonObject): ActionResponse =
         resolveApproval(requestId, response["decision"]?.jsonPrimitive?.content ?: "decline")
@@ -358,7 +633,56 @@ class ApiClient(
         else -> CbdpApprovalDecision.DECLINE
     }
 
+    private fun companionEvents(
+        threadId: String?,
+        sink: (StreamEvent) -> Unit,
+        onTerminal: () -> Unit,
+    ): EventSource {
+        val path = buildString {
+            append("/api/companion/events")
+            if (!threadId.isNullOrBlank()) {
+                append("?thread_id=")
+                append(java.net.URLEncoder.encode(threadId, "UTF-8"))
+            }
+        }
+        val request = Request.Builder()
+            .url(url(path))
+            .header("Accept", "text/event-stream")
+            .apply { if (!token.isNullOrBlank()) header("Authorization", "Bearer $token") }
+            .build()
+        val listener = object : EventSourceListener() {
+            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
+                if (data.isBlank()) return
+                decodeStreamEvent(data)?.let { event ->
+                    sink(event)
+                }
+            }
+
+            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+                sink(StreamEvent(type = "stream_error", message = t?.message ?: "事件流已断开"))
+                onTerminal()
+            }
+
+            override fun onClosed(eventSource: EventSource) {
+                sink(StreamEvent(type = "stream_error", message = "事件流已断开"))
+                onTerminal()
+            }
+        }
+        return EventSources.createFactory(client).newEventSource(request, listener)
+    }
+
     fun events(threadId: String? = null): Flow<StreamEvent> = callbackFlow {
+        if (resolveTransport() == Transport.COMPANION) {
+            val source = companionEvents(
+                threadId = threadId,
+                sink = { event -> trySend(event) },
+                onTerminal = { close() },
+            )
+            awaitClose {
+                source.cancel()
+            }
+            return@callbackFlow
+        }
         val client = ensureCbdp()
         val activeThread = threadId.orEmpty()
         val threadRef = CbdpMapper.threadRef(activeThread).takeIf { activeThread.isNotBlank() }
