@@ -82,6 +82,7 @@ fun ChatScreen(
     onSend: (String) -> Unit,
     onConsumeRestoreInput: () -> Unit = {},
     onStop: () -> Unit,
+    onClaimThread: (Boolean) -> Unit = {},
     onPickModel: (String) -> Unit,
     onResolveApproval: (Int, String) -> Unit,
     onRespondApproval: (Int, JsonObject) -> Unit,
@@ -179,9 +180,10 @@ fun ChatScreen(
                     AssistChip(
                         onClick = { showModels = true },
                         label = { Text(state.modelLabel, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        enabled = state.canWrite,
                     )
                     if (state.working) {
-                        IconButton(onClick = onStop) {
+                        IconButton(onClick = onStop, enabled = state.canWrite) {
                             Icon(Icons.Filled.Close, contentDescription = "中断", tint = MaterialTheme.colorScheme.error)
                         }
                     }
@@ -204,6 +206,26 @@ fun ChatScreen(
                     accent = MaterialTheme.colorScheme.error,
                 )
             }
+            if (!state.canWrite) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (state.ownerState.isBlank()) {
+                            "当前线程没有写入权限"
+                        } else {
+                            "当前写入者：${state.ownerState}"
+                        },
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { onClaimThread(false) }) { Text("接管线程") }
+                }
+            }
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 LazyColumn(
                     state = listState,
@@ -215,7 +237,12 @@ fun ChatScreen(
                         MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
                     }
                     items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
-                        ApprovalCard(approval = approval, onDecision = onResolveApproval, onResponse = onRespondApproval)
+                        ApprovalCard(
+                            approval = approval,
+                            writable = state.canWrite,
+                            onDecision = onResolveApproval,
+                            onResponse = onRespondApproval,
+                        )
                     }
                 }
                 if (state.chatLoading) {
@@ -258,6 +285,7 @@ fun ChatScreen(
                 QueuePanel(
                     items = state.queue,
                     working = state.working,
+                    writable = state.canWrite,
                     onSteer = onSteerQueue,
                     onEdit = { item ->
                         editingQueue = item
@@ -293,6 +321,7 @@ fun ChatScreen(
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
+                    enabled = state.canWrite,
                     placeholder = {
                         Text("发送后加入队列", maxLines = 1)
                     },
@@ -309,7 +338,7 @@ fun ChatScreen(
                             onSend(text)
                         }
                     },
-                    enabled = input.isNotBlank() && !state.sending,
+                    enabled = state.canWrite && input.isNotBlank() && !state.sending,
                     modifier = Modifier
                         .size(48.dp)
                         .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
@@ -370,6 +399,7 @@ fun ChatScreen(
         ModelPickerSheet(
             models = state.models,
             selectedModel = state.selectedModel,
+            enabled = state.canWrite,
             onSelect = { model ->
                 showModels = false
                 onPickModel(model.slug)
@@ -383,6 +413,7 @@ fun ChatScreen(
 private fun QueuePanel(
     items: List<QueueItem>,
     working: Boolean,
+    writable: Boolean,
     onSteer: (QueueItem) -> Unit,
     onEdit: (QueueItem) -> Unit,
     onDelete: (QueueItem) -> Unit,
@@ -410,11 +441,11 @@ private fun QueuePanel(
                     Text(item.text, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (working && item.status == "pending" && item.revision > 0) {
-                            TextButton(onClick = { onSteer(item) }) { Text("引导") }
+                            TextButton(onClick = { onSteer(item) }, enabled = writable) { Text("引导") }
                         }
                         if (item.status == "pending" || item.status == "failed") {
-                            TextButton(onClick = { onEdit(item) }) { Text("编辑") }
-                            TextButton(onClick = { onDelete(item) }) { Text("删除") }
+                            TextButton(onClick = { onEdit(item) }, enabled = writable) { Text("编辑") }
+                            TextButton(onClick = { onDelete(item) }, enabled = writable) { Text("删除") }
                         }
                     }
                 }
@@ -747,8 +778,12 @@ private fun NoticeLine(text: String) {
 }
 
 @Composable
-private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) -> Unit,
-                         onResponse: (Int, JsonObject) -> Unit) {
+private fun ApprovalCard(
+    approval: ApprovalRequest,
+    writable: Boolean,
+    onDecision: (Int, String) -> Unit,
+    onResponse: (Int, JsonObject) -> Unit,
+) {
     val detail = approval.raw
     var answers by remember(approval.request_id) { mutableStateOf(mapOf<String, String>()) }
     var structured by remember(approval.request_id) { mutableStateOf("{}") }
@@ -831,7 +866,7 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
             if (approval.kind == "permissions" || approval.kind == "mcp") {
                 OutlinedTextField(value = structured, onValueChange = { structured = it },
                     label = { Text(if (approval.kind == "permissions") "授权范围 JSON" else "表单内容 JSON") },
-                    modifier = Modifier.fillMaxWidth(), minLines = 3)
+                    modifier = Modifier.fillMaxWidth(), minLines = 3, enabled = writable)
             }
             if (approval.kind in setOf("input", "permissions", "mcp")) {
                 val parsed = runCatching { Json.parseToJsonElement(structured) as? JsonObject }.getOrNull()
@@ -848,7 +883,7 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
                         }
                     }
                     onResponse(approval.request_id, response)
-                }, enabled = if (approval.kind == "input")
+                }, enabled = writable && if (approval.kind == "input")
                     detail.questions.all { !answers[it.id].isNullOrBlank() } else parsed != null) {
                     Text("提交")
                 }
@@ -858,12 +893,14 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
             ) {
                 Button(
                     onClick = { onDecision(approval.request_id, "accept") },
+                    enabled = writable,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("允许")
                 }
                 OutlinedButton(
                     onClick = { onDecision(approval.request_id, "acceptForSession") },
+                    enabled = writable,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("本会话允许")
@@ -875,12 +912,14 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
             ) {
                 TextButton(
                     onClick = { onDecision(approval.request_id, "decline") },
+                    enabled = writable,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("拒绝")
                 }
                 TextButton(
                     onClick = { onDecision(approval.request_id, "cancel") },
+                    enabled = writable,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("取消")

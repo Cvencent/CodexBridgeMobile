@@ -173,6 +173,7 @@ fun MonoBlock(text: String, modifier: Modifier = Modifier) {
 fun ModelPickerSheet(
     models: List<ModelInfo>,
     selectedModel: String,
+    enabled: Boolean = true,
     onSelect: (ModelInfo) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -188,7 +189,7 @@ fun ModelPickerSheet(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onSelect(model) }
+                        .clickable(enabled = enabled) { onSelect(model) }
                         .padding(horizontal = 20.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {

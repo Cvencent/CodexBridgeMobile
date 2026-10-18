@@ -167,14 +167,14 @@ class CompletionNotificationService : Service() {
             onWifi = isOnWifi(),
         )
         val selected = ConnectionSelector.select(candidates) { endpoint ->
-            ApiClient(endpoint.url, settings.token).ping()
+            ApiClient(endpoint.url, settings.token, settings.phoneId).ping()
         }
         if (selected != null) {
             settings.lastSuccessfulUrl = selected.url
             settings.baseUrl = selected.url
-            return ApiClient(selected.url, settings.token)
+            return ApiClient(selected.url, settings.token, settings.phoneId)
         }
-        return ApiClient(settings.baseUrl, settings.token)
+        return ApiClient(settings.baseUrl, settings.token, settings.phoneId)
     }
 
     private fun isOnWifi(): Boolean {

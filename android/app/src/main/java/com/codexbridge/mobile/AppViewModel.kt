@@ -11,6 +11,10 @@ import com.codexbridge.mobile.data.ApiClient
 import com.codexbridge.mobile.data.ApiException
 import com.codexbridge.mobile.data.ConnectionRoute
 import com.codexbridge.mobile.data.ConnectionSelector
+import com.codexbridge.mobile.data.cbdp.CbdpTag
+import com.codexbridge.mobile.data.cbdp.CbdpTlv
+import com.codexbridge.mobile.data.cbdp.u8
+import com.codexbridge.mobile.data.cbdp.u32
 import com.codexbridge.mobile.data.ApprovalRequest
 import com.codexbridge.mobile.data.DiscoveredBridge
 import com.codexbridge.mobile.data.Discovery
@@ -86,6 +90,12 @@ data class UiState(
     val truncated: Boolean = false,
     val queue: List<QueueItem> = emptyList(),
     val sending: Boolean = false,
+    val canWrite: Boolean = false,
+    val ownerState: String = "",
+    val leaseGeneration: Long = 0,
+    val deviceRef: String = "",
+    val activeThreadId: String = "",
+    val activeDeviceId: String = "",
     val restoreInput: String = "",
     val discovered: List<DiscoveredBridge> = emptyList(),
     val discovering: Boolean = false,
@@ -190,7 +200,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         if (paired) {
-            api = ApiClient(base, settings.token)
+            api = ApiClient(base, settings.token, settings.phoneId)
             CompletionNotificationService.start(appContext)
             startThreadsRefresh()
             refreshConnectionRoute()
@@ -209,7 +219,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 onWifi = isOnWifi(),
             )
             val selected = ConnectionSelector.select(candidates) { endpoint ->
-                ApiClient(endpoint.url, settings.token).ping()
+                ApiClient(endpoint.url, settings.token, settings.phoneId).ping()
             }
             if (selected != null) {
                 val previous = _state.value.baseUrl
@@ -217,7 +227,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings.baseUrl = selected.url
                 val role = selected.endpoint.role.name.lowercase()
                 if (previous != selected.url || api == null || _state.value.activeRouteRole != role) {
-                    api = ApiClient(selected.url, settings.token)
+                    api = ApiClient(selected.url, settings.token, settings.phoneId)
                     _state.update { state ->
                         state.copy(
                             baseUrl = selected.url,
@@ -247,7 +257,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (_state.value.discovering) return
         _state.update { it.copy(discovering = true, error = null) }
         viewModelScope.launch {
-            val found = Discovery.discover(_state.value.discoveryPort)
+            val found = Discovery.discover(
+                discoveryPort = _state.value.discoveryPort,
+                deviceId = settings.phoneId.ifBlank { settings.installationId },
+            )
             _state.update {
                 it.copy(
                     discovered = found,
@@ -276,10 +289,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val paired = ConnectionSelector.select(enteredCandidates) { endpoint ->
-                    val candidate = ApiClient(endpoint.url)
+                    val candidate = ApiClient(endpoint.url, phoneId = settings.phoneId.ifBlank { settings.installationId })
                     candidate.ping().takeIf { it.ok && it.service == "codexbridge-companion" }
                 } ?: throw ApiException("无法连接电脑，请检查地址和网络")
-                val client = ApiClient(paired.url)
+                val client = ApiClient(paired.url, phoneId = settings.phoneId.ifBlank { settings.installationId })
                 val ping = client.ping()
                 val response = withContext(Dispatchers.IO) {
                     client.pair(code.trim(), phoneName(), settings.installationId)
@@ -299,7 +312,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings.phoneId = response.phone_id
                 settings.bridgeName = response.bridge.name.ifBlank { ping.name }
                 settings.bridgeVersion = response.bridge.version.ifBlank { ping.version }
-                api = ApiClient(resolved.base, response.token)
+                settings.phoneId = response.phone_id
+                api = ApiClient(resolved.base, response.token, response.phone_id)
                 _state.update {
                     it.copy(
                         busy = false,
@@ -448,6 +462,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun refreshAccount() {
+        val client = api ?: return
+        viewModelScope.launch {
+            runCatching { client.account() }
+                .onSuccess { account ->
+                    _state.update { it.copy(account = account) }
+                }
+        }
+    }
+
     private fun loadProjects() {
         val client = api ?: return
         viewModelScope.launch {
@@ -500,6 +524,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 approvals = emptyList(),
                 queue = emptyList(),
                 busy = true,
+                canWrite = false,
+                ownerState = "",
+                leaseGeneration = 0,
+                activeThreadId = "",
+                activeDeviceId = "",
                 task = seededTask,
                 working = seededTask.isWorking || visibleSummary.status in ACTIVE_TASK_STATUSES,
             )
@@ -536,6 +565,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 observeThread(threadId)
+                refreshWriterState(threadId)
             } catch (error: Exception) {
                 _state.update { it.copy(busy = false) }
                 handleError(error)
@@ -556,6 +586,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 streaming = emptyMap(),
                 queue = emptyList(),
                 sending = false,
+                canWrite = false,
+                ownerState = "",
+                leaseGeneration = 0,
+                activeThreadId = "",
+                activeDeviceId = "",
             )
         }
         refreshThreadsNow()
@@ -616,11 +651,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val threadId = _state.value.activeThread?.thread_id ?: return
         val content = text.trim()
         if (content.isEmpty()) return
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
         settings.clearPendingCompletion(threadId)
         _state.update { it.copy(error = null, sending = true) }
         viewModelScope.launch {
             try {
-                client.enqueueMessage(
+                client.sendMessage(
                     threadId = threadId,
                     text = content,
                     model = _state.value.selectedModel,
@@ -651,6 +690,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun steerQueue(item: QueueItem) {
         val client = api ?: return
         val threadId = _state.value.activeThread?.thread_id ?: return
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
         viewModelScope.launch {
             runCatching { client.steerQueue(item.queue_id, item.revision) }
                 .onSuccess { refreshQueue(threadId) }
@@ -661,6 +704,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun editQueue(item: QueueItem, text: String) {
         val client = api ?: return
         val threadId = _state.value.activeThread?.thread_id ?: return
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
         val content = text.trim()
         if (content.isEmpty()) return
         viewModelScope.launch {
@@ -681,6 +728,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteQueue(item: QueueItem) {
         val client = api ?: return
         val threadId = _state.value.activeThread?.thread_id ?: return
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
         viewModelScope.launch {
             runCatching { client.deleteQueue(item.queue_id, item.revision) }
                 .onSuccess { refreshQueue(threadId) }
@@ -711,9 +762,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun claimThread(force: Boolean = false) {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        viewModelScope.launch {
+            runCatching {
+                client.claimThread(threadId, force)
+            }.onSuccess {
+                refreshWriterState(threadId)
+            }.onFailure { handleError(it) }
+        }
+    }
+
+    fun releaseThread() {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        val lease = _state.value.leaseGeneration
+        if (lease <= 0) return
+        viewModelScope.launch {
+            runCatching {
+                client.releaseThread(threadId, lease)
+            }.onSuccess {
+                refreshWriterState(threadId)
+            }.onFailure { handleError(it) }
+        }
+    }
+
+    private fun refreshWriterState(threadId: String) {
+        val client = api ?: return
+        viewModelScope.launch {
+            val currentDevice = runCatching { client.deviceRef() }.getOrDefault("")
+            val owner = runCatching {
+                client.thread(threadId).thread
+            }.getOrNull()
+            if (currentDevice.isNotBlank()) {
+                _state.update { it.copy(deviceRef = currentDevice) }
+            }
+            if (owner == null) return@launch
+            applyWriterState(
+                threadId = threadId,
+                ownerState = owner.owner_state,
+                leaseGeneration = owner.lease_generation,
+                activeDeviceId = owner.owner_device_ref,
+            )
+        }
+    }
+
+    private fun applyWriterState(
+        threadId: String,
+        ownerState: String,
+        leaseGeneration: Long,
+        activeDeviceId: String,
+    ) {
+        val normalized = ownerState.lowercase()
+        val currentThread = _state.value.activeThread?.thread_id.orEmpty()
+        val matchesThread = threadId.isBlank() || currentThread.isBlank() || threadId == currentThread
+        val currentDevice = _state.value.deviceRef.ifBlank { "" }
+        val ownerMatches = activeDeviceId.isNotBlank() && currentDevice.isNotBlank() && activeDeviceId == currentDevice
+        val writable = normalized in setOf("claimed", "managed") && ownerMatches
+        _state.update { state ->
+            if (!matchesThread) return@update state
+            state.copy(
+                canWrite = writable,
+                ownerState = ownerState,
+                leaseGeneration = leaseGeneration,
+                activeDeviceId = activeDeviceId,
+            )
+        }
+    }
+
     fun stop() {
         val client = api ?: return
         val threadId = _state.value.activeThread?.thread_id ?: return
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
         viewModelScope.launch {
             runCatching { client.interrupt(threadId, _state.value.task.turn_id) }
                 .onSuccess { _state.update { it.copy(working = false, notice = "已请求中断") } }
@@ -955,6 +1079,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             "turn_steered" -> Unit
             "thread_status" -> {
                 val threadId = event.thread_id
+                if (event.status == "deleted") {
+                    _state.update { state ->
+                        val removedActive = state.activeThread?.thread_id == threadId
+                        state.copy(
+                            threads = state.threads.filterNot { it.thread_id == threadId },
+                            activeThread = state.activeThread?.takeUnless { it.thread_id == threadId },
+                            messages = if (removedActive) emptyList() else state.messages,
+                            queue = if (removedActive) emptyList() else state.queue,
+                            messageCount = if (removedActive) 0 else state.messageCount,
+                            working = if (removedActive) false else state.working,
+                        )
+                    }
+                    if (threadId.isNotBlank()) refreshThreadsNow()
+                    return
+                }
                 if (
                     threadId.isNotBlank() &&
                     (event.status == "active" || event.status == "idle" || event.active_flags.isNotEmpty())
@@ -985,6 +1124,35 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             "token_usage" -> _state.update {
                 it.copy(task = it.task.copy(tokenCount = event.total_tokens, tokenCountAvailable = event.total_tokens > 0))
+            }
+            "account_changed" -> refreshAccount()
+            "writer_state" -> {
+                val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
+                applyWriterState(
+                    threadId = threadId,
+                    ownerState = event.owner_state,
+                    leaseGeneration = event.lease_generation,
+                    activeDeviceId = event.active_device_id,
+                )
+            }
+            "active_state" -> _state.update {
+                it.copy(
+                    activeThreadId = event.active_thread_id,
+                    activeDeviceId = event.active_device_id,
+                )
+            }
+            "models_changed" -> loadModels()
+            "projects_changed" -> loadProjects()
+            "message_deleted" -> {
+                if (event.item_id.isBlank()) return
+                _state.update { state ->
+                    val remaining = state.messages.filterNot { it.id == event.item_id }
+                    state.copy(
+                        messages = remaining,
+                        messageCount = remaining.size,
+                        streaming = state.streaming - event.item_id,
+                    )
+                }
             }
             "thread_name" -> {
                 val title = event.title

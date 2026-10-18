@@ -143,6 +143,7 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 onSend = viewModel::send,
                 onConsumeRestoreInput = viewModel::consumeRestoreInput,
                 onStop = viewModel::stop,
+                onClaimThread = viewModel::claimThread,
                 onPickModel = { slug -> viewModel.selectModel(slug) },
                 onResolveApproval = viewModel::resolveApproval,
                 onRespondApproval = viewModel::respondApproval,

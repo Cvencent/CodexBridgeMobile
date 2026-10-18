@@ -147,6 +147,9 @@ data class ThreadSummary(
     val tokens: Long = 0,
     val ephemeral: Boolean = false,
     val error_message: String = "",
+    val owner_state: String = "",
+    val owner_device_ref: String = "",
+    val lease_generation: Long = 0,
 )
 
 @Serializable
@@ -172,6 +175,8 @@ data class ApprovalQuestion(
 @Serializable
 data class MessageDetail(
     val status: String = "",
+    val body_ref: String = "",
+    val body: String = "",
     @SerialName("exit_code") val exitCode: Int? = null,
     val cwd: String = "",
     @SerialName("duration_ms") val durationMs: Long? = null,
@@ -314,7 +319,7 @@ data class ProjectsResponse(
     val default_cwd: String = "",
 )
 
-/** Parsed SSE payload from `/api/companion/events`. */
+/** Parsed CBDP v1 event payload. */
 @Serializable
 data class StreamEvent(
     val type: String = "",
@@ -351,6 +356,15 @@ data class StreamEvent(
     val expires_at: Double = 0.0,
     val created_at: Double = 0.0,
     val raw: MessageDetail = MessageDetail(),
+    // CBDP v1 writer lease and cross-device activity state.
+    val owner_state: String = "",
+    val writable: Boolean = false,
+    val lease_generation: Long = 0,
+    val lease_expires_at: Long = 0,
+    val active_thread_id: String = "",
+    val active_turn_id: String = "",
+    val active_device_id: String = "",
+    val active_revision: Long = 0,
 )
 
 private val streamEventJson = Json {
