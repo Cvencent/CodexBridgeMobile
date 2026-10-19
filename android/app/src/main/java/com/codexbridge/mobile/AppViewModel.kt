@@ -1597,7 +1597,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 else -> state.threads.firstOrNull { it.thread_id == threadId }?.status.orEmpty()
             }
             val status = applyThreadRead(current, readStatus)
-            if (readStatus != "idle" && current in TERMINAL_TASK_STATUSES) {
+            if (current in TERMINAL_TASK_STATUSES) {
                 val threadUpdatedAt = state.threads
                     .firstOrNull { it.thread_id == threadId }?.updated_at ?: 0
                 val activeUpdatedAt = state.activeThread?.updated_at ?: 0
