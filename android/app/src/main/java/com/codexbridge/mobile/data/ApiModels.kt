@@ -80,6 +80,7 @@ data class QueueResponse(
     @SerialName("thread_id") val threadId: String = "",
     @SerialName("items") val queue: List<QueueItem> = emptyList(),
     val revision: Long = 0,
+    val paused: Boolean = false,
 )
 
 @Serializable
@@ -375,6 +376,7 @@ data class StreamEvent(
     val queueItem: QueueItem? = null,
     @SerialName("expected_revision") val expectedRevision: Long = 0,
     val removed: Boolean = false,
+    val paused: Boolean = false,
     // Approval payload fields.
     val kind: String = "",
     val command: String = "",

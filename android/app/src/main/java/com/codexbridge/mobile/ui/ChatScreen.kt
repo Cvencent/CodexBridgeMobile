@@ -281,12 +281,15 @@ fun ChatScreen(
                     }
                 }
             }
-            if (state.queue.isNotEmpty()) {
+            if (state.queue.isNotEmpty() || state.queuePaused) {
                 QueuePanel(
                     items = state.queue,
+                    paused = state.queuePaused,
+                    pauseReason = state.queuePauseReason,
                     working = state.working,
                     writable = state.canWrite,
                     onSteer = onSteerQueue,
+                    onRetry = { item -> onEditQueue(item, item.text) },
                     onEdit = { item ->
                         editingQueue = item
                         editingText = item.text
@@ -412,9 +415,12 @@ fun ChatScreen(
 @Composable
 private fun QueuePanel(
     items: List<QueueItem>,
+    paused: Boolean = false,
+    pauseReason: String = "",
     working: Boolean,
     writable: Boolean,
     onSteer: (QueueItem) -> Unit,
+    onRetry: (QueueItem) -> Unit = {},
     onEdit: (QueueItem) -> Unit,
     onDelete: (QueueItem) -> Unit,
 ) {
@@ -433,6 +439,13 @@ private fun QueuePanel(
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (paused) {
+                Text(
+                    text = if (pauseReason.isBlank()) "队列已暂停，点“重新派发”恢复" else "队列已暂停：$pauseReason",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             items.forEach { item ->
                 Column(
                     modifier = Modifier.fillMaxWidth(),
@@ -444,6 +457,9 @@ private fun QueuePanel(
                             TextButton(onClick = { onSteer(item) }, enabled = writable) { Text("引导") }
                         }
                         if (item.status == "pending" || item.status == "failed") {
+                            if (paused || item.status == "failed") {
+                                TextButton(onClick = { onRetry(item) }, enabled = writable) { Text("重新派发") }
+                            }
                             TextButton(onClick = { onEdit(item) }, enabled = writable) { Text("编辑") }
                             TextButton(onClick = { onDelete(item) }, enabled = writable) { Text("删除") }
                         }

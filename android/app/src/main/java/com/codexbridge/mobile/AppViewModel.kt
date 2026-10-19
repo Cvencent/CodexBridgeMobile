@@ -92,6 +92,8 @@ data class UiState(
     val messageCount: Int = 0,
     val truncated: Boolean = false,
     val queue: List<QueueItem> = emptyList(),
+    val queuePaused: Boolean = false,
+    val queuePauseReason: String = "",
     val sending: Boolean = false,
     val canWrite: Boolean = false,
     val ownerState: String = "",
@@ -590,6 +592,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 streaming = emptyMap(),
                 approvals = emptyList(),
                 queue = emptyList(),
+                queuePaused = false,
+                queuePauseReason = "",
                 busy = true,
                 canWrite = false,
                 ownerState = "",
@@ -628,6 +632,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             threadId,
                             detail.queue.items,
                         ),
+                        queuePaused = detail.queue.paused,
+                        queuePauseReason = detail.queue.items.firstOrNull { it.error.isNotBlank() }?.error.orEmpty(),
                         busy = false,
                     )
                 }
@@ -652,6 +658,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 messages = emptyList(),
                 streaming = emptyMap(),
                 queue = emptyList(),
+                queuePaused = false,
+                queuePauseReason = "",
                 sending = false,
                 canWrite = false,
                 ownerState = "",
@@ -823,12 +831,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val content = text.trim()
-        if (content.isEmpty()) return
+        if (content.isEmpty() && item.text.isBlank()) return
+        val resolvedText = content.ifBlank { item.text }
         viewModelScope.launch {
             runCatching {
                 client.editQueue(
                     queueId = item.queue_id,
-                    text = content,
+                    text = resolvedText,
                     expectedRevision = item.revision,
                     model = _state.value.selectedModel,
                     effort = _state.value.selectedEffort,
@@ -865,6 +874,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 threadId,
                                 response.queue,
                             ),
+                            queuePaused = response.paused,
+                            queuePauseReason = response.queue.firstOrNull { it.error.isNotBlank() }?.error.orEmpty(),
                             sending = false,
                         )
                     }
@@ -1344,9 +1355,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _state.value.activeThread?.thread_id.orEmpty()
                 }
                 if (threadId.isNotBlank()) {
-                    if (event.message.isNotBlank()) {
-                        _state.update { it.copy(error = event.message) }
-                    }
+                    _state.update { it.copy(queuePaused = true, queuePauseReason = event.message) }
                     refreshQueue(threadId)
                 }
             }
