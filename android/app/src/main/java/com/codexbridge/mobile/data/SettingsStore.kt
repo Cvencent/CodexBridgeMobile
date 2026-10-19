@@ -88,6 +88,20 @@ class SettingsStore(context: Context) : CompletionNotificationState {
         get() = prefs.getInt("discovery_port", ApiClient.DEFAULT_DISCOVERY_PORT)
         set(value) = prefs.edit().putInt("discovery_port", value).apply()
 
+    /**
+     * Bridge can emit completed rows without a completion timestamp. The user
+     * opening the thread is still a read acknowledgement, so remember it until
+     * Bridge reports a newer update for the same thread.
+     */
+    fun markThreadReadOverride(threadId: String, seenAt: Long) {
+        if (threadId.isBlank() || seenAt <= 0) return
+        prefs.edit().putLong("read_idle_override_$threadId", seenAt).apply()
+    }
+
+    fun threadReadOverrideAt(threadId: String): Long =
+        if (threadId.isBlank()) 0L
+        else prefs.getLong("read_idle_override_$threadId", 0L)
+
     override fun markCompletionSeen(threadId: String, notificationKey: String): Boolean {
         if (threadId.isBlank() || notificationKey.isBlank()) return false
         val key = "notified_$notificationKey"
@@ -152,6 +166,7 @@ class SettingsStore(context: Context) : CompletionNotificationState {
                 it.startsWith("completion_seen_") ||
                     it.startsWith("completion_watermark_") ||
                     it.startsWith("pending_completion_") ||
+                    it.startsWith("read_idle_override_") ||
                     it.startsWith("notified_")
             }
             .forEach(editor::remove)

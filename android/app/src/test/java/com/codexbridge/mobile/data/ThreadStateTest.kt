@@ -63,6 +63,21 @@ class ThreadStateTest {
     }
 
     @Test
+    fun failureWithoutCompletionTimestampStaysRunnable() {
+        val failed = ThreadSummary(
+            thread_id = "thread-1",
+            turn_id = "turn-1",
+            status = "failed",
+            completed_at = 0,
+        )
+
+        assertEquals("working", normalizeUnconfirmedFailure(failed).status)
+        assertEquals("failed", normalizeUnconfirmedFailure(failed.copy(error_message = "network error")).status)
+        assertEquals("failed", normalizeUnconfirmedFailure(failed.copy(completed_at = 20)).status)
+        assertEquals("failed", normalizeUnconfirmedFailure(failed.copy(turn_id = "")).status)
+    }
+
+    @Test
     fun completionNotificationKeyIsSharedBySseAndPollingWhenTurnIsKnown() {
         val fromSse = completionNotificationKey("thread-1", "turn-1", 1000)
         val fromPolling = completionNotificationKey("thread-1", "turn-1", 1001)

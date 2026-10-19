@@ -31,9 +31,11 @@ import com.codexbridge.mobile.data.ThreadDetailResponse
 import com.codexbridge.mobile.data.TaskSnapshot
 import com.codexbridge.mobile.data.ThreadSummary
 import com.codexbridge.mobile.data.ACTIVE_TASK_STATUSES
+import com.codexbridge.mobile.data.TERMINAL_TASK_STATUSES
 import com.codexbridge.mobile.data.coherentTaskStatus
 import com.codexbridge.mobile.data.applyThreadStatusEvent
 import com.codexbridge.mobile.data.applyThreadRead
+import com.codexbridge.mobile.data.normalizeUnconfirmedFailure
 import com.codexbridge.mobile.data.confirmedPendingCompletionIds
 import com.codexbridge.mobile.data.mergePendingCompletions
 import com.codexbridge.mobile.data.sortThreadsByActivity
@@ -497,9 +499,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             .fold(
                 onSuccess = { response ->
                 val visible = mergePendingThreads(response.threads, clearConfirmed = true)
+                    val normalized = visible.map(::normalizeUnconfirmedFailure).map { thread ->
+                        val readOverride = settings.threadReadOverrideAt(thread.thread_id)
+                        if (
+                            readOverride > 0 &&
+                            thread.status == "completed" &&
+                            thread.completed_at <= 0
+                        ) {
+                            thread.copy(status = "idle")
+                        } else {
+                            thread
+                        }
+                    }
                 _state.update { state ->
                     state.copy(
-                        threads = visible,
+                        threads = normalized,
                         connected = true,
                         refreshing = false,
                         manualRefreshing = false,
@@ -1466,15 +1480,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         detail: com.codexbridge.mobile.data.ThreadDetailResponse,
         currentStatus: String,
     ): ReconciledThreadDetail {
+        val unconfirmedFailure =
+            detail.task.status == "failed" &&
+                detail.thread.completed_at <= 0 &&
+                detail.task.completed_at_epoch <= 0 &&
+                detail.thread.turn_id.isNotBlank() &&
+                detail.thread.error_message.isBlank()
+        val normalizedDetail = if (unconfirmedFailure) {
+            detail.copy(
+                thread = detail.thread.copy(status = "working"),
+                task = detail.task.copy(status = "working"),
+            )
+        } else {
+            detail
+        }
         val serverStatus = coherentTaskStatus(
             currentStatus,
-            detail.task.status.ifBlank { detail.thread.status },
+            normalizedDetail.task.status.ifBlank { normalizedDetail.thread.status },
         )
         val completedAt = maxOf(
-            detail.thread.completed_at,
-            detail.task.completed_at_epoch,
+            normalizedDetail.thread.completed_at,
+            normalizedDetail.task.completed_at_epoch,
         )
-        val baseThread = detail.thread.copy(
+        val baseThread = normalizedDetail.thread.copy(
             status = serverStatus,
             completed_at = completedAt,
             updated_at = maxOf(detail.thread.updated_at, completedAt),
@@ -1486,9 +1514,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             ?: baseThread
         return ReconciledThreadDetail(
             thread = visibleThread,
-            task = detail.task.copy(
+            task = normalizedDetail.task.copy(
                 status = visibleThread.status,
-                completed_at_epoch = maxOf(detail.task.completed_at_epoch, completedAt),
+                completed_at_epoch = maxOf(normalizedDetail.task.completed_at_epoch, completedAt),
             ),
         )
     }
@@ -1528,7 +1556,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     detail.thread.completed_at,
                     detail.task.completed_at_epoch,
                 )
-                if (serverStatus != "failed" || serverCompletedAt <= 0 || serverCompletedAt >= failedAt) {
+                if (serverStatus != "failed" || (serverCompletedAt > 0 && serverCompletedAt >= failedAt)) {
                     applyThreadDetail(threadId, detail)
                 }
             } finally {
@@ -1569,6 +1597,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 else -> state.threads.firstOrNull { it.thread_id == threadId }?.status.orEmpty()
             }
             val status = applyThreadRead(current, readStatus)
+            if (readStatus != "idle" && current in TERMINAL_TASK_STATUSES) {
+                settings.markThreadReadOverride(threadId, System.currentTimeMillis())
+            }
             if (status == current) return@update state
             state.copy(
                 activeThread = state.activeThread?.let { thread ->

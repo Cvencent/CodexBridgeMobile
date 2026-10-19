@@ -107,6 +107,23 @@ fun applyThreadRead(current: String, incoming: String): String =
     else if (incoming == "idle" && current in ACTIVE_TASK_STATUSES) current
     else coherentTaskStatus(current, incoming)
 
+/**
+ * A failed turn without a completion timestamp is an unconfirmed transport
+ * hiccup, not an authoritative terminal state. Keep it runnable until Bridge
+ * supplies the missing lifecycle timestamp.
+ */
+fun normalizeUnconfirmedFailure(thread: ThreadSummary): ThreadSummary =
+    if (
+        thread.status == "failed" &&
+        thread.completed_at <= 0 &&
+        thread.turn_id.isNotBlank() &&
+        thread.error_message.isBlank()
+    ) {
+        thread.copy(status = "working")
+    } else {
+        thread
+    }
+
 fun sortThreadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
     threads.sortedWith(
         compareBy<ThreadSummary> {
