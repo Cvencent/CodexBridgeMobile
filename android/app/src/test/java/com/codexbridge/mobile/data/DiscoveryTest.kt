@@ -35,6 +35,13 @@ class DiscoveryTest {
     }
 
     @Test
+    fun legacyJsonDiscoveryReplyIsAccepted() {
+        val reply = """{"service":"codexbridge-companion","name":"DESKTOP-TEST","version":"2.1.2","port":8568,"discovery_port":8569,"requires_pairing":true}"""
+            .toByteArray(Charsets.UTF_8)
+        assertTrue(Discovery.isMatchingReplyForTest(reply, nonce))
+    }
+
+    @Test
     fun wrongMessageTypeIsRejected() {
         val frame = CbdpFrame(
             header = CbdpHeader(messageType = CbdpMessageType.DELTA),

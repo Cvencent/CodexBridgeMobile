@@ -13,6 +13,11 @@ import com.codexbridge.mobile.data.cbdp.u16
 import com.codexbridge.mobile.data.cbdp.utf8
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -57,7 +62,9 @@ object Discovery {
     private const val TIMEOUT_MS = 3500L
     private const val MAX_DISCOVERY_BYTES = 1024
     private const val SCOPE_SUBNET = 1
+    private val LEGACY_REQUEST = "CODEXBRIDGE_COMPANION_DISCOVER".toByteArray(Charsets.US_ASCII)
     private val random = SecureRandom()
+    private val discoveryJson = Json { ignoreUnknownKeys = true }
 
     suspend fun discover(
         discoveryPort: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
@@ -80,15 +87,17 @@ object Discovery {
                     val now = System.currentTimeMillis()
                     if (now >= nextSend) {
                         targets.forEach { target ->
-                            runCatching {
-                                socket.send(
-                                    DatagramPacket(
-                                        request,
-                                        request.size,
-                                        InetAddress.getByName(target),
-                                        discoveryPort,
-                                    ),
-                                )
+                            listOf(request, LEGACY_REQUEST).forEach { payload ->
+                                runCatching {
+                                    socket.send(
+                                        DatagramPacket(
+                                            payload,
+                                            payload.size,
+                                            InetAddress.getByName(target),
+                                            discoveryPort,
+                                        ),
+                                    )
+                                }
                             }
                         }
                         nextSend = now + 650L
@@ -178,20 +187,41 @@ object Discovery {
 
     private fun parseReply(bytes: ByteArray, expectedNonce: ByteArray): DiscoveryReply? {
         if (bytes.size > MAX_DISCOVERY_BYTES) return null
-        val frame = runCatching { CbdpCodec.decode(bytes) }.getOrNull() ?: return null
-        if (frame.header.messageType != CbdpMessageType.DISCOVERY_REPLY) return null
-        val returnedNonce = frame.tlvs.bytes(CbdpTag.DISCOVERY_NONCE) ?: return null
-        if (!returnedNonce.contentEquals(expectedNonce)) return null
-        val deviceId = frame.tlvs.utf8(CbdpTag.DEVICE_ID).orEmpty()
-        if (deviceId.isBlank()) return null
-        val port = frame.tlvs.u16(CbdpTag.PORT) ?: ApiClient.DEFAULT_PORT
+        runCatching { CbdpCodec.decode(bytes) }.getOrNull()?.let { frame ->
+            if (frame.header.messageType != CbdpMessageType.DISCOVERY_REPLY) return@let
+            val returnedNonce = frame.tlvs.bytes(CbdpTag.DISCOVERY_NONCE) ?: return@let
+            if (!returnedNonce.contentEquals(expectedNonce)) return@let
+            val deviceId = frame.tlvs.utf8(CbdpTag.DEVICE_ID).orEmpty()
+            if (deviceId.isBlank()) return@let
+            val port = frame.tlvs.u16(CbdpTag.PORT) ?: ApiClient.DEFAULT_PORT
+            if (port !in 1..65535) return@let
+            return DiscoveryReply(
+                deviceId = deviceId,
+                model = frame.tlvs.utf8(CbdpTag.MODEL).orEmpty(),
+                firmware = frame.tlvs.utf8(CbdpTag.FIRMWARE).orEmpty(),
+                port = port,
+                bridgeInstanceId = frame.tlvs.bytes(CbdpTag.BRIDGE_INSTANCE_ID) ?: ByteArray(0),
+            )
+        }
+        return parseLegacyReply(bytes)
+    }
+
+    private fun parseLegacyReply(bytes: ByteArray): DiscoveryReply? {
+        val text = bytes.toString(Charsets.UTF_8).trim()
+        if (!text.startsWith("{")) return null
+        val json = runCatching { discoveryJson.parseToJsonElement(text) as JsonObject }.getOrNull() ?: return null
+        val service = json["service"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        if (service != "codexbridge-companion") return null
+        val port = json["port"]?.jsonPrimitive?.intOrNull ?: return null
         if (port !in 1..65535) return null
+        val name = json["name"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val version = json["version"]?.jsonPrimitive?.contentOrNull.orEmpty()
         return DiscoveryReply(
-            deviceId = deviceId,
-            model = frame.tlvs.utf8(CbdpTag.MODEL).orEmpty(),
-            firmware = frame.tlvs.utf8(CbdpTag.FIRMWARE).orEmpty(),
+            deviceId = "companion:${name.ifBlank { "codexbridge" }}:$port",
+            model = name,
+            firmware = version,
             port = port,
-            bridgeInstanceId = frame.tlvs.bytes(CbdpTag.BRIDGE_INSTANCE_ID) ?: ByteArray(0),
+            bridgeInstanceId = ByteArray(0),
         )
     }
 

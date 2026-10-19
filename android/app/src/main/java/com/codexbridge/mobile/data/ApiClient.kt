@@ -786,7 +786,7 @@ class ApiClient(
 
     companion object {
         const val DEFAULT_PORT = 8568
-        const val DEFAULT_DISCOVERY_PORT = 8764
+        const val DEFAULT_DISCOVERY_PORT = 8569
         private const val LEGACY_DEFAULT_PORT = 8790
         private const val LEGACY_COMPANION_PORT = 8791
         private const val LEGACY_DISCOVERY_PORT = 8766
