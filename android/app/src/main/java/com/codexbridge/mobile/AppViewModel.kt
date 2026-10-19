@@ -503,8 +503,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         val readOverride = settings.threadReadOverrideAt(thread.thread_id)
                         if (
                             readOverride > 0 &&
-                            thread.status == "completed" &&
-                            thread.completed_at <= 0
+                            thread.status in TERMINAL_TASK_STATUSES &&
+                            maxOf(thread.updated_at, thread.completed_at, thread.recency_at) <= readOverride
                         ) {
                             thread.copy(status = "idle")
                         } else {
@@ -660,7 +660,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // Mark only after the authoritative detail lands; otherwise a
                 // slower detail snapshot can overwrite the read-induced idle
                 // state with the stale completed row.
-                runCatching { client.markThreadRead(threadId) }.onSuccess { response ->
+                    runCatching { client.markThreadRead(threadId) }.onSuccess { response ->
                     applyThreadReadState(threadId, response.status.ifBlank { "idle" })
                 }
                 observeThread(threadId)
@@ -1598,7 +1598,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             val status = applyThreadRead(current, readStatus)
             if (readStatus != "idle" && current in TERMINAL_TASK_STATUSES) {
-                settings.markThreadReadOverride(threadId, System.currentTimeMillis())
+                val threadUpdatedAt = state.threads
+                    .firstOrNull { it.thread_id == threadId }?.updated_at ?: 0
+                val activeUpdatedAt = state.activeThread?.updated_at ?: 0
+                settings.markThreadReadOverride(
+                    threadId,
+                    maxOf(System.currentTimeMillis(), threadUpdatedAt, activeUpdatedAt),
+                )
             }
             if (status == current) return@update state
             state.copy(
