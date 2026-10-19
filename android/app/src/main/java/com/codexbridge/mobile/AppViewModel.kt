@@ -609,13 +609,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             try {
-                // Read acknowledgement must not delay the detail request. The
-                // extra round trip was responsible for most of the blank chat.
-                viewModelScope.launch {
-                    runCatching { client.markThreadRead(threadId) }.onSuccess { response ->
-                        applyThreadReadState(threadId, response.status.ifBlank { "idle" })
-                    }
-                }
                 val detail = client.thread(threadId)
                 val reconciled = reconcileThreadDetail(
                     detail,
@@ -643,6 +636,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         queuePauseReason = detail.queue.items.firstOrNull { it.error.isNotBlank() }?.error.orEmpty(),
                         busy = false,
                     )
+                }
+                // Mark only after the authoritative detail lands; otherwise a
+                // slower detail snapshot can overwrite the read-induced idle
+                // state with the stale completed row.
+                runCatching { client.markThreadRead(threadId) }.onSuccess { response ->
+                    applyThreadReadState(threadId, response.status.ifBlank { "idle" })
                 }
                 observeThread(threadId)
                 refreshWriterState(threadId)

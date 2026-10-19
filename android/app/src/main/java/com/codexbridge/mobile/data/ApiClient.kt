@@ -624,23 +624,18 @@ class ApiClient(
         return CbdpMapper.sendResponse(execute(CbdpMethod.QUEUE_DELETE, params), "")
     }
 
-    suspend fun markThreadRead(threadId: String): SendResponse = withTransport(
-        cbdpCall = {
-            CbdpMapper.sendResponse(
-                execute(CbdpMethod.THREAD_READ_STATE_UPDATE, listOf(CbdpTlv(CbdpTag.THREAD_REF, CbdpCodec.u32(requireThreadRef(threadId))))),
-                threadId,
-            )
-        },
-        companionCall = {
-            json.decodeFromString(
-                SendResponse.serializer(),
-                postText(
-                    "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/read",
-                    buildJsonObject { },
-                ),
-            )
-        },
-    )
+    /**
+     * Thread-level read state has no supported CBDP method in Bridge 2.1.x.
+     * The HTTP companion route is the authority and works for every transport.
+     */
+    suspend fun markThreadRead(threadId: String): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            postText(
+                "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/read",
+                buildJsonObject { },
+            ),
+        )
 
     suspend fun claimThread(threadId: String, force: Boolean = false): ActionResponse = withTransport(
         cbdpCall = {
