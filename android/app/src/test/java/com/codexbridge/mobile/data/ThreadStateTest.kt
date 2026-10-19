@@ -55,6 +55,14 @@ class ThreadStateTest {
     }
 
     @Test
+    fun readAcknowledgementTurnsFinishedTasksIdleButNotActiveOnes() {
+        assertEquals("idle", applyThreadRead("completed", "idle"))
+        assertEquals("idle", applyThreadRead("failed", "idle"))
+        assertEquals("working", applyThreadRead("working", "idle"))
+        assertEquals("waiting_user", applyThreadRead("waiting_user", "idle"))
+    }
+
+    @Test
     fun completionNotificationKeyIsSharedBySseAndPollingWhenTurnIsKnown() {
         val fromSse = completionNotificationKey("thread-1", "turn-1", 1000)
         val fromPolling = completionNotificationKey("thread-1", "turn-1", 1001)

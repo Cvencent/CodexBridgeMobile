@@ -27,11 +27,13 @@ import com.codexbridge.mobile.data.applyQueueSnapshot
 import com.codexbridge.mobile.data.applyQueueUpdate
 import com.codexbridge.mobile.data.SettingsStore
 import com.codexbridge.mobile.data.StreamEvent
+import com.codexbridge.mobile.data.ThreadDetailResponse
 import com.codexbridge.mobile.data.TaskSnapshot
 import com.codexbridge.mobile.data.ThreadSummary
 import com.codexbridge.mobile.data.ACTIVE_TASK_STATUSES
 import com.codexbridge.mobile.data.coherentTaskStatus
 import com.codexbridge.mobile.data.applyThreadStatusEvent
+import com.codexbridge.mobile.data.applyThreadRead
 import com.codexbridge.mobile.data.confirmedPendingCompletionIds
 import com.codexbridge.mobile.data.mergePendingCompletions
 import com.codexbridge.mobile.data.sortThreadsByActivity
@@ -140,6 +142,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var threadsJob: Job? = null
     private val refreshLock = Mutex()
     private var foreground = false
+    private val failureConfirmations = mutableMapOf<String, Job>()
 
     fun setForeground(visible: Boolean) {
         if (!visible) {
@@ -608,7 +611,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 // Read acknowledgement must not delay the detail request. The
                 // extra round trip was responsible for most of the blank chat.
-                viewModelScope.launch { runCatching { client.markThreadRead(threadId) } }
+                viewModelScope.launch {
+                    runCatching { client.markThreadRead(threadId) }.onSuccess { response ->
+                        applyThreadReadState(threadId, response.status.ifBlank { "idle" })
+                    }
+                }
                 val detail = client.thread(threadId)
                 val reconciled = reconcileThreadDetail(
                     detail,
@@ -1162,12 +1169,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             "turn_started" -> {
                 val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
                 if (threadId.isNotBlank()) settings.clearPendingCompletion(threadId)
+                cancelTurnFailureConfirmation(threadId)
                 _state.update { it.copy(working = true) }
             }
             "turn_completed" -> {
                 val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
                 val completionStatus = if (event.status == "failed") "failed" else "completed"
                 val completedAt = event.completed_at.takeIf { it > 0 } ?: System.currentTimeMillis() / 1000
+                if (completionStatus == "failed") {
+                    // Model/transport retries can surface a transient failure
+                    // event. Confirm against thread state before retiring a
+                    // task that may still be running.
+                    confirmTurnFailure(threadId, completedAt, event.error_message)
+                    return
+                }
+                cancelTurnFailureConfirmation(threadId)
                 val viewing = foreground && _state.value.screen == AppScreen.Chat && _state.value.activeThread?.thread_id == threadId
                 if (viewing && threadId.isNotBlank() && !event.read) {
                     viewModelScope.launch { runCatching { api?.markThreadRead(threadId) } }
@@ -1256,6 +1272,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     (event.status == "active" || event.status == "idle" || event.active_flags.isNotEmpty())
                 ) {
                     settings.clearPendingCompletion(threadId)
+                }
+                if (event.status == "active" || event.active_flags.isNotEmpty()) {
+                    cancelTurnFailureConfirmation(threadId)
                 }
                 _state.update { state ->
                     val activeMatches = threadId.isBlank() || state.activeThread?.thread_id == threadId
@@ -1486,6 +1505,79 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return merged.values.sortedBy { it.request_id }
     }
 
+    private fun cancelTurnFailureConfirmation(threadId: String) {
+        if (threadId.isBlank()) return
+        failureConfirmations.remove(threadId)?.cancel()
+    }
+
+    private fun confirmTurnFailure(threadId: String, failedAt: Long, errorMessage: String) {
+        if (threadId.isBlank()) return
+        cancelTurnFailureConfirmation(threadId)
+        failureConfirmations[threadId] = viewModelScope.launch {
+            try {
+                delay(FAILURE_CONFIRMATION_DELAY_MS)
+                val client = api ?: return@launch
+                val detail = runCatching { client.thread(threadId) }.getOrNull() ?: return@launch
+                val serverStatus = detail.task.status.ifBlank { detail.thread.status }
+                val serverCompletedAt = maxOf(
+                    detail.thread.completed_at,
+                    detail.task.completed_at_epoch,
+                )
+                if (serverStatus != "failed" || serverCompletedAt <= 0 || serverCompletedAt >= failedAt) {
+                    applyThreadDetail(threadId, detail)
+                }
+            } finally {
+                failureConfirmations.remove(threadId)
+            }
+        }
+    }
+
+    private fun applyThreadDetail(threadId: String, detail: ThreadDetailResponse) {
+        val reconciled = reconcileThreadDetail(
+            detail,
+            _state.value.activeThread?.status.orEmpty(),
+        )
+        val status = reconciled.thread.status
+        _state.update { state ->
+            state.copy(
+                activeThread = if (state.activeThread?.thread_id == threadId) reconciled.thread else state.activeThread,
+                threads = state.threads.map { thread ->
+                    if (thread.thread_id == threadId) reconciled.thread else thread
+                },
+                messages = detail.messages,
+                task = reconciled.task,
+                approvals = detail.pending_approvals,
+                working = status in ACTIVE_TASK_STATUSES,
+                messageCount = detail.message_count,
+                queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
+            )
+        }
+    }
+
+    private fun applyThreadReadState(threadId: String, readStatus: String) {
+        if (threadId.isBlank()) return
+        _state.update { state ->
+            val activeMatches = state.activeThread?.thread_id == threadId
+            val current = when {
+                activeMatches -> state.activeThread?.status.orEmpty()
+                state.task.thread_id == threadId -> state.task.status
+                else -> state.threads.firstOrNull { it.thread_id == threadId }?.status.orEmpty()
+            }
+            val status = applyThreadRead(current, readStatus)
+            if (status == current) return@update state
+            state.copy(
+                activeThread = state.activeThread?.let { thread ->
+                    if (thread.thread_id == threadId) thread.copy(status = status) else thread
+                },
+                threads = state.threads.map { thread ->
+                    if (thread.thread_id == threadId) thread.copy(status = status) else thread
+                },
+                task = if (state.task.thread_id == threadId) state.task.copy(status = status) else state.task,
+                working = if (activeMatches) status in ACTIVE_TASK_STATUSES else state.working,
+            )
+        }
+    }
+
     private fun handleError(error: Throwable) {
         // A 401 can be a transient bridge restart or a stale token. Keep the
         // saved address/token/installation identity so the next launch can
@@ -1512,5 +1604,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val THREADS_REFRESH_MS = 30_000L
         private const val THREAD_POLL_MS = 30_000L
+        private const val FAILURE_CONFIRMATION_DELAY_MS = 2_500L
     }
 }

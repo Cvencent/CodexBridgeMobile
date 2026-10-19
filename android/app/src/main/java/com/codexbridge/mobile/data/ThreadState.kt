@@ -1,6 +1,7 @@
 package com.codexbridge.mobile.data
 
 val ACTIVE_TASK_STATUSES = setOf("working", "waiting_user")
+val TERMINAL_TASK_STATUSES = setOf("completed", "failed")
 
 data class PendingCompletion(
     val threadId: String,
@@ -96,6 +97,15 @@ fun threadStatusToTaskStatus(status: String, activeFlags: List<String>, current:
 
 fun applyThreadStatusEvent(current: String, status: String, activeFlags: List<String>): String =
     coherentTaskStatus(current, threadStatusToTaskStatus(status.lowercase(), activeFlags, current))
+
+/**
+ * A read acknowledgement turns a finished task idle, but must never retire a
+ * turn that started while the request was in flight.
+ */
+fun applyThreadRead(current: String, incoming: String): String =
+    if (incoming == "idle" && current in TERMINAL_TASK_STATUSES) "idle"
+    else if (incoming == "idle" && current in ACTIVE_TASK_STATUSES) current
+    else coherentTaskStatus(current, incoming)
 
 fun sortThreadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
     threads.sortedWith(
