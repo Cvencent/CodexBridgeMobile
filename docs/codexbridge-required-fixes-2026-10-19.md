@@ -1,8 +1,25 @@
-# CodexBridge 需要修复的问题清单（2026-10-19）
+# CodexBridge 需要修复的问题清单（已由 Bridge v2.1.7/v2.1.8 修复）
 
 来源：CodexBridgeMobile 1.0.6 实测。
 下面只列 Bridge 需要改的部分；Mobile 已做兼容兜底，但 Bridge 是状态权威，
 最终还是要由 Bridge 修复数据语义。
+
+## 处理结果（2026-10-19）
+
+Bridge 已在 v2.1.7 修复本文的 P0/P1 状态问题：
+
+1. `completed` / `failed` 终态会补齐有效的 `completed_at`。
+2. `failed` / `interrupted` 但拿不到结束时间时保持 `working`，不再把网络/
+   供应商重连误判为真实失败。
+3. 已读水位不再依赖 `completed_at > 0`，历史无完成时间的线程也能持久化已读。
+4. `threads.list`、`thread.read`、`thread_status`、`turn_completed` 的状态和
+   时间戳保持一致。
+
+Bridge v2.1.8 另外修复了 CBDP 幂等键、订阅回放阻塞上行、`AUDIO_BEGIN`
+线程选择器和单帧异常断连问题。
+
+Mobile 1.0.6 的兜底逻辑与 Bridge v2.1.7+ 兼容，可以继续使用；真实终态会带
+有效时间戳，因此不会被客户端兜底覆盖。
 
 ## P0：终态必须有有效 `completed_at`
 
