@@ -156,7 +156,7 @@ class ApiClient(
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.0.0",
+                firmware = "1.0.9",
             )
             cbdp = created
             return created

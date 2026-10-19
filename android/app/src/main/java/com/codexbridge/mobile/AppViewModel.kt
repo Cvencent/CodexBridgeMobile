@@ -985,7 +985,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val matchesThread = threadId.isBlank() || currentThread.isBlank() || threadId == currentThread
         val currentDevice = _state.value.deviceRef.ifBlank { "" }
         val ownerMatches = activeDeviceId.isNotBlank() && currentDevice.isNotBlank() && activeDeviceId == currentDevice
-        val writable = normalized in setOf("claimed", "managed") && ownerMatches
+        // CodexBridge does not publish a writer lease on the CBDP path yet:
+        // owner_state / owner_device_ref arrive empty. Treat "no lease announced"
+        // as writable so a task the phone just created is usable without the
+        // manual "接管线程" step. An explicit claimed/managed lease still has to
+        // name this device.
+        val leaseAnnounced = normalized.isNotBlank() && normalized != "unmanaged"
+        val writable = if (leaseAnnounced) {
+            normalized in setOf("claimed", "managed") && ownerMatches
+        } else {
+            true
+        }
         _state.update { state ->
             if (!matchesThread) return@update state
             state.copy(

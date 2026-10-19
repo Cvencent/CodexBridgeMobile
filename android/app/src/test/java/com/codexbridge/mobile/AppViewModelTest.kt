@@ -41,6 +41,53 @@ class AppViewModelTest {
         assertEquals("working", visible.last().status)
     }
 
+    @Test
+    fun unannouncedWriterLeaseStaysWritable() {
+        val context = RuntimeEnvironment.getApplication()
+        val model = AppViewModel(context)
+        val state = stateOf(model)
+        state.value = UiState(
+            screen = AppScreen.Chat,
+            activeThread = ThreadSummary(thread_id = "thread-1"),
+            deviceRef = "7",
+        )
+        invokeApplyWriterState(model, "thread-1", "", 0, "")
+
+        assertEquals(true, state.value.canWrite)
+    }
+
+    @Test
+    fun explicitForeignLeaseIsNotWritable() {
+        val context = RuntimeEnvironment.getApplication()
+        val model = AppViewModel(context)
+        val state = stateOf(model)
+        state.value = UiState(
+            screen = AppScreen.Chat,
+            activeThread = ThreadSummary(thread_id = "thread-1"),
+            deviceRef = "7",
+        )
+        invokeApplyWriterState(model, "thread-1", "claimed", 3, "99")
+
+        assertEquals(false, state.value.canWrite)
+    }
+
+    private fun invokeApplyWriterState(
+        model: AppViewModel,
+        threadId: String,
+        ownerState: String,
+        leaseGeneration: Long,
+        activeDeviceId: String,
+    ) {
+        val method = AppViewModel::class.java.getDeclaredMethod(
+            "applyWriterState",
+            String::class.java,
+            String::class.java,
+            Long::class.javaPrimitiveType,
+            String::class.java,
+        ).apply { isAccessible = true }
+        method.invoke(model, threadId, ownerState, leaseGeneration, activeDeviceId)
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun stateOf(model: AppViewModel): MutableStateFlow<UiState> {
         val field = AppViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
