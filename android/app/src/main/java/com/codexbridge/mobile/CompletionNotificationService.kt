@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.app.ActivityManager
 import android.media.RingtoneManager
 import android.media.AudioManager
 import android.provider.Settings
@@ -317,11 +316,7 @@ class CompletionNotificationService : Service() {
     }
 
     private fun isAppForeground(): Boolean {
-        val manager = getSystemService(ActivityManager::class.java) ?: return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            return manager.appTasks.any { it.taskInfo.topActivity?.packageName == packageName }
-        }
-        return false
+        return AppForeground.visible
     }
 
     private fun notifyCompletion(threadId: String, failed: Boolean, completedAt: Long) {

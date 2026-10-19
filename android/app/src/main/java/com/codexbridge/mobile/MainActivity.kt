@@ -64,10 +64,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        AppForeground.visible = true
         viewModel.setForeground(true)
     }
 
     override fun onPause() {
+        AppForeground.visible = false
         viewModel.setForeground(false)
         super.onPause()
     }

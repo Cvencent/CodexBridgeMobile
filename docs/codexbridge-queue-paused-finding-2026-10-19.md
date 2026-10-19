@@ -1,8 +1,15 @@
-# Codex Bridge queue `paused` 生命周期问题（Mobile 只读排查）
+# Codex Bridge queue `paused` 生命周期问题（已由 Bridge 修复）
 
 日期：2026-10-19
 发现方：CodexBridgeMobile
 Bridge 版本：2.1.2（本机运行版）
+
+## 处理结果（2026-10-19）
+
+Bridge v2.1.3 已修复本问题：`queue.delete` 删除失败项、新的 `queue.enqueue`、
+以及 turn 正常完成都会清除该线程的 `paused`。用户删除失败项后直接重发即可恢复，
+不再需要编辑同一条失败记录。Mobile 1.0.2 起保留“队列已暂停”展示与
+“重新派发”入口，便于旧 Bridge 和失败后的可见操作。
 
 ## 现象
 
