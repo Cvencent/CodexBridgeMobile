@@ -47,6 +47,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import java.util.UUID
 import kotlin.random.Random
@@ -395,23 +396,26 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(manualRefreshing = true) }
         viewModelScope.launch {
             try {
-                val status = client.status()
-                _state.update {
-                    it.copy(
-                        connected = true,
-                        account = status.account,
-                        approvals = mergeApprovals(it.approvals, status.pending_approvals),
-                        task = if (it.activeThread == null) status.task else it.task,
-                        working = if (it.activeThread == null) status.task.isWorking else it.working,
-                    )
+                withTimeout(REFRESH_TIMEOUT_MS) {
+                    val status = client.status()
+                    _state.update {
+                        it.copy(
+                            connected = true,
+                            account = status.account,
+                            approvals = mergeApprovals(it.approvals, status.pending_approvals),
+                            task = if (it.activeThread == null) status.task else it.task,
+                            working = if (it.activeThread == null) status.task.isWorking else it.working,
+                        )
+                    }
                 }
+                if (!refreshThreads()) refreshConnectionRoute()
+                loadProjects()
+                loadModels()
             } catch (error: Exception) {
                 handleError(error)
+            } finally {
+                _state.update { it.copy(manualRefreshing = false) }
             }
-            if (!refreshThreads()) refreshConnectionRoute()
-            loadProjects()
-            loadModels()
-            _state.update { it.copy(manualRefreshing = false) }
         }
     }
 
@@ -487,7 +491,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun refreshThreads(): Boolean = refreshLock.withLock {
         val client = api ?: return@withLock false
         _state.update { it.copy(refreshing = true) }
-        runCatching { client.threads(_state.value.search) }
+        runCatching {
+            withTimeout(REFRESH_TIMEOUT_MS) { client.threads(_state.value.search) }
+        }
             .fold(
                 onSuccess = { response ->
                 val visible = mergePendingThreads(response.threads, clearConfirmed = true)
@@ -1604,5 +1610,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         private const val THREADS_REFRESH_MS = 30_000L
         private const val THREAD_POLL_MS = 30_000L
         private const val FAILURE_CONFIRMATION_DELAY_MS = 2_500L
+        private const val REFRESH_TIMEOUT_MS = 20_000L
     }
 }

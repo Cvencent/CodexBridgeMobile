@@ -200,6 +200,13 @@ class ApiClient(
             } else {
                 throw error
             }
+        } catch (error: ApiException) {
+            if (error.code == "cbdp_timeout") {
+                fallBackToCompanion()
+                companionCall()
+            } else {
+                throw error
+            }
         }
         Transport.COMPANION -> companionCall()
         Transport.UNKNOWN -> error("transport not resolved")
@@ -243,7 +250,10 @@ class ApiClient(
             ensureCbdp().execute(methodId, params)
         } catch (error: Exception) {
             if (error is ApiException) throw error
-            throw ApiException(error.message ?: "CBDP 请求失败", "cbdp_error")
+            throw ApiException(
+                error.message ?: "CBDP 请求失败",
+                if (error is kotlinx.coroutines.TimeoutCancellationException) "cbdp_timeout" else "cbdp_error",
+            )
         }
 
     private fun requireThreadRef(threadId: String): Long = CbdpMapper.threadRef(threadId)
