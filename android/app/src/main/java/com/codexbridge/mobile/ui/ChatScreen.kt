@@ -86,12 +86,15 @@ fun ChatScreen(
     onPickModel: (String) -> Unit,
     onResolveApproval: (Int, String) -> Unit,
     onRespondApproval: (Int, JsonObject) -> Unit,
+    onSetApprovalMode: (com.codexbridge.mobile.data.cbdp.ApprovalMode) -> Unit = {},
     onSteerQueue: (QueueItem) -> Unit = {},
     onEditQueue: (QueueItem, String) -> Unit = { _, _ -> },
     onDeleteQueue: (QueueItem) -> Unit = {},
 ) {
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
+    var showApprovalMode by remember { mutableStateOf(false) }
+    var confirmFullAccess by remember { mutableStateOf(false) }
     var editingQueue by remember { mutableStateOf<QueueItem?>(null) }
     var editingText by remember { mutableStateOf("") }
     var deletingQueue by remember { mutableStateOf<QueueItem?>(null) }
@@ -182,6 +185,13 @@ fun ChatScreen(
                         label = { Text(state.modelLabel, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                         enabled = state.canWrite,
                     )
+                    if (state.bridgeCapabilities.threadSettings) {
+                        AssistChip(
+                            onClick = { showApprovalMode = true },
+                            label = { Text(state.approvalMode.label) },
+                            enabled = state.canWrite && !state.approvalModeChanging,
+                        )
+                    }
                     if (state.working) {
                         IconButton(onClick = onStop, enabled = state.canWrite) {
                             Icon(Icons.Filled.Close, contentDescription = "中断", tint = MaterialTheme.colorScheme.error)
@@ -240,9 +250,18 @@ fun ChatScreen(
                         ApprovalCard(
                             approval = approval,
                             writable = state.canWrite,
+                            structuredWritable = state.bridgeCapabilities.approvalResponse,
                             onDecision = onResolveApproval,
                             onResponse = onRespondApproval,
                         )
+                        if (!state.bridgeCapabilities.approvalResponse) {
+                            Text(
+                                text = "电脑端版本较旧，暂时只能拒绝或取消该请求",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 4.dp),
+                            )
+                        }
                     }
                 }
                 if (state.chatLoading) {
@@ -364,6 +383,93 @@ fun ChatScreen(
         }
     }
 
+    if (showApprovalMode) {
+        AlertDialog(
+            onDismissRequest = { showApprovalMode = false },
+            title = { Text("审批模式") },
+            text = {
+                Column {
+                    Text(
+                        text = if (state.working) {
+                            "当前任务运行中，切换将在下一轮生效。"
+                        } else {
+                            "选择 Codex 在本会话中向你询问的频率。"
+                        },
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    com.codexbridge.mobile.data.cbdp.ApprovalMode.entries.forEach { mode ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (mode == com.codexbridge.mobile.data.cbdp.ApprovalMode.FullAccess) {
+                                        confirmFullAccess = true
+                                    } else {
+                                        showApprovalMode = false
+                                        onSetApprovalMode(mode)
+                                    }
+                                }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            androidx.compose.material3.RadioButton(
+                                selected = state.approvalMode == mode,
+                                onClick = {
+                                    if (mode == com.codexbridge.mobile.data.cbdp.ApprovalMode.FullAccess) {
+                                        confirmFullAccess = true
+                                    } else {
+                                        showApprovalMode = false
+                                        onSetApprovalMode(mode)
+                                    }
+                                },
+                            )
+                            Column {
+                                Text(mode.label, fontWeight = FontWeight.Medium)
+                                Text(
+                                    text = if (mode == com.codexbridge.mobile.data.cbdp.ApprovalMode.RequestApproval) {
+                                        "执行命令、修改文件和网络操作前询问你"
+                                    } else {
+                                        "不再询问普通操作；工具表单仍需要你确认"
+                                    },
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showApprovalMode = false }) { Text("取消") }
+            },
+        )
+    }
+
+    if (confirmFullAccess) {
+        AlertDialog(
+            onDismissRequest = { confirmFullAccess = false },
+            title = { Text("切换到完全允许？") },
+            text = {
+                Text(
+                    "Codex 执行命令、修改文件和访问网络时将不再逐次询问。" +
+                        "请确认你知道这会让电脑端承担更大的操作风险。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmFullAccess = false
+                    showApprovalMode = false
+                    onSetApprovalMode(com.codexbridge.mobile.data.cbdp.ApprovalMode.FullAccess)
+                }) { Text("仍要切换") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmFullAccess = false }) { Text("取消") }
+            },
+        )
+    }
     deletingQueue?.let { target ->
         AlertDialog(
             onDismissRequest = { deletingQueue = null },
@@ -797,6 +903,7 @@ private fun NoticeLine(text: String) {
 private fun ApprovalCard(
     approval: ApprovalRequest,
     writable: Boolean,
+    structuredWritable: Boolean = true,
     onDecision: (Int, String) -> Unit,
     onResponse: (Int, JsonObject) -> Unit,
 ) {
@@ -899,7 +1006,7 @@ private fun ApprovalCard(
                         }
                     }
                     onResponse(approval.request_id, response)
-                }, enabled = writable && if (approval.kind == "input")
+                }, enabled = writable && structuredWritable && if (approval.kind == "input")
                     detail.questions.all { !answers[it.id].isNullOrBlank() } else parsed != null) {
                     Text("提交")
                 }

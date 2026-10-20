@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.codexbridge.mobile.data.Account
 import com.codexbridge.mobile.data.ApiClient
 import com.codexbridge.mobile.data.ApiException
+import com.codexbridge.mobile.data.BridgeCapabilities
 import com.codexbridge.mobile.data.ConnectionRoute
 import com.codexbridge.mobile.data.ConnectionSelector
 import com.codexbridge.mobile.data.cbdp.CbdpTag
@@ -101,6 +102,10 @@ data class UiState(
     val queuePauseReason: String = "",
     val sending: Boolean = false,
     val canWrite: Boolean = false,
+    val approvalMode: com.codexbridge.mobile.data.cbdp.ApprovalMode =
+        com.codexbridge.mobile.data.cbdp.ApprovalMode.RequestApproval,
+    val approvalModeChanging: Boolean = false,
+    val bridgeCapabilities: BridgeCapabilities = BridgeCapabilities(),
     val ownerState: String = "",
     val leaseGeneration: Long = 0,
     val deviceRef: String = "",
@@ -1082,6 +1087,49 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setApprovalMode(mode: com.codexbridge.mobile.data.cbdp.ApprovalMode) {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        if (!_state.value.bridgeCapabilities.threadSettings) {
+            _state.update { it.copy(error = "电脑端版本较旧，暂不支持切换审批模式") }
+            return
+        }
+        if (!_state.value.canWrite) {
+            _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
+            return
+        }
+        val previous = _state.value.approvalMode
+        if (previous == mode) return
+        _state.update { it.copy(approvalModeChanging = true, error = null) }
+        viewModelScope.launch {
+            runCatching {
+                client.updateThreadSettings(
+                    threadId = threadId,
+                    approvalPolicy = mode.approvalPolicy,
+                    sandboxPolicy = mode.sandboxPolicy,
+                )
+            }.onSuccess {
+                val message = if (_state.value.working) {
+                    "已切换为" + mode.label + "；运行中的任务下一轮生效"
+                } else {
+                    "已切换为" + mode.label
+                }
+                _state.update {
+                    it.copy(
+                        approvalMode = mode,
+                        approvalModeChanging = false,
+                        notice = message,
+                    )
+                }
+            }.onFailure { error ->
+                _state.update {
+                    it.copy(approvalMode = previous, approvalModeChanging = false)
+                }
+                handleError(error)
+            }
+        }
+    }
+
     fun selectModel(model: String, effort: String = "") {
         settings.selectedModel = model
         settings.selectedEffort = effort
@@ -1627,6 +1675,40 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 task = if (state.task.thread_id == threadId) state.task.copy(status = status) else state.task,
                 working = if (activeMatches) status in ACTIVE_TASK_STATUSES else state.working,
             )
+        }
+    }
+
+    private fun refreshBridgeCapabilities() {
+        val client = api ?: return
+        viewModelScope.launch {
+            runCatching { client.bridgeCapabilities() }
+                .onSuccess { capabilities ->
+                    _state.update { it.copy(bridgeCapabilities = capabilities) }
+                }
+        }
+    }
+
+    private fun refreshThreadSettings(threadId: String) {
+        val client = api ?: return
+        viewModelScope.launch {
+            runCatching { client.threadSettings(threadId) }
+                .onSuccess { settings ->
+                    val resolved = when {
+                        settings.approvalPolicy == "never" ||
+                            settings.sandboxPolicy == "danger-full-access" ->
+                            com.codexbridge.mobile.data.cbdp.ApprovalMode.FullAccess
+                        settings.approvalPolicy == "on-request" ||
+                            settings.sandboxPolicy == "workspace-write" ->
+                            com.codexbridge.mobile.data.cbdp.ApprovalMode.RequestApproval
+                        else -> null
+                    }
+                    if (resolved != null) {
+                        _state.update { it.copy(approvalMode = resolved) }
+                    }
+                    if (settings.cwd.isNotBlank()) {
+                        _state.update { it.copy(selectedCwd = settings.cwd) }
+                    }
+                }
         }
     }
 

@@ -21,6 +21,8 @@ import com.codexbridge.mobile.data.TaskSnapshot
 import com.codexbridge.mobile.data.ThreadDetailResponse
 import com.codexbridge.mobile.data.ThreadSummary
 import com.codexbridge.mobile.data.ThreadsResponse
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 internal object CbdpMapper {
     const val OBJECT_THREAD = 0

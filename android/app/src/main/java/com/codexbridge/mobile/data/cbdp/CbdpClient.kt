@@ -568,6 +568,47 @@ class CbdpClient(
 
     suspend fun activeState(): CbdpCommand = execute(CbdpMethod.ACTIVE_STATE_READ, emptyList())
 
+    /**
+     * APPROVAL_RESOLVE is a dedicated CBDP frame (0x17), not a COMMAND.
+     * The bridge reads its fields from the frame header and can carry an
+     * optional structured MCP response.
+     */
+    suspend fun resolveApproval(
+        approvalRef: Long,
+        decision: Int? = null,
+        responseFields: List<CbdpTlv> = emptyList(),
+        timeoutMs: Long = 15000,
+    ): CbdpCommand {
+        connect()
+        val requestId = requestIds.incrementAndGet()
+        val tlvs = mutableListOf(
+            CbdpTlv(CbdpTag.REQUEST_ID, CbdpCodec.u32(requestId)),
+            CbdpTlv(CbdpTag.APPROVAL_REF, CbdpCodec.u32(approvalRef)),
+        )
+        if (decision != null) tlvs += CbdpTlv(CbdpTag.DECISION, CbdpCodec.u8(decision))
+        if (responseFields.isNotEmpty()) {
+            tlvs += CbdpTlv(CbdpTag.RESPONSE, CbdpCodec.encodeTlvs(responseFields))
+        }
+        val frame = CbdpFrame(
+            CbdpHeader(
+                messageType = CbdpMessageType.APPROVAL_RESOLVE,
+                flags = CbdpFlags.REQUEST,
+                seq = session.nextSequence(),
+                qos = CbdpQos.CRITICAL,
+            ),
+            tlvs = tlvs,
+        )
+        val waiter = PendingCommand(CbdpMethod.APPROVAL_RESOLVE, kotlinx.coroutines.CompletableDeferred())
+        synchronized(pending) { pending[requestId] = waiter }
+        try {
+            sendReliable(frame)
+            return withTimeout(timeoutMs) { waiter.completion.await() }
+        } catch (error: Throwable) {
+            synchronized(pending) { pending.remove(requestId) }
+            throw error
+        }
+    }
+
     suspend fun sendText(
         txId: Long,
         text: String,

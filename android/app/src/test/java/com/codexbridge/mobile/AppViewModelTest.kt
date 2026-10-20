@@ -117,4 +117,20 @@ class AppViewModelTest {
         assertEquals("内网", state.activeRouteLabel)
     }
 
+
+    @Test
+    fun approvalModeDefaultsToRequestApproval() {
+        val state = UiState()
+        assertEquals(com.codexbridge.mobile.data.cbdp.ApprovalMode.RequestApproval, state.approvalMode)
+        assertEquals(false, state.approvalModeChanging)
+        assertEquals(false, state.bridgeCapabilities.threadSettings)
+        assertEquals(false, state.bridgeCapabilities.attachments)
+    }
+
+    @Test
+    fun approvalModeFullAccessMapsToCodexValues() {
+        val mode = com.codexbridge.mobile.data.cbdp.ApprovalMode.FullAccess
+        assertEquals("never", mode.approvalPolicy)
+        assertEquals("danger-full-access", mode.sandboxPolicy)
+    }
 }

@@ -54,6 +54,21 @@ object CbdpScope {
     }
 }
 
+
+/**
+ * One user-selectable Codex approval posture. The wire values follow
+ * CBDP `approval_policy` and `sandbox_policy` and are sent together because
+ * "full access" is not meaningful if the sandbox still denies the action.
+ */
+enum class ApprovalMode(
+    val approvalPolicy: String,
+    val sandboxPolicy: String,
+    val label: String,
+) {
+    RequestApproval("on-request", "workspace-write", "请求批准"),
+    FullAccess("never", "danger-full-access", "完全允许"),
+}
+
 object CbdpTopic {
     const val SYSTEM_BRIDGE = 0x50000000L
     const val SYSTEM_DEVICES = 0x50000001L

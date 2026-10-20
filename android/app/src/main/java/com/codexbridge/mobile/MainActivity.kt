@@ -149,6 +149,7 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 onPickModel = { slug -> viewModel.selectModel(slug) },
                 onResolveApproval = viewModel::resolveApproval,
                 onRespondApproval = viewModel::respondApproval,
+                onSetApprovalMode = viewModel::setApprovalMode,
                 onSteerQueue = viewModel::steerQueue,
                 onEditQueue = viewModel::editQueue,
                 onDeleteQueue = viewModel::deleteQueue,

@@ -277,6 +277,19 @@ data class ApprovalRequest(
         }
 }
 
+
+@Serializable
+data class ThreadSettings(
+    @SerialName("model") val model: String = "",
+    @SerialName("cwd") val cwd: String = "",
+    @SerialName("effort") val effort: String = "",
+    @SerialName("approval_policy") val approvalPolicy: String = "",
+    @SerialName("sandbox_policy") val sandboxPolicy: String = "",
+    @SerialName("approvals_reviewer") val approvalsReviewer: String = "",
+    @SerialName("settings_revision") val settingsRevision: Long = 0,
+    @SerialName("applied") val applied: Boolean = true,
+)
+
 @Serializable
 data class StatusResponse(
     val ok: Boolean = false,

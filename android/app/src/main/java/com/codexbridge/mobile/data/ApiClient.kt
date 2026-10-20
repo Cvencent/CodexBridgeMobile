@@ -53,6 +53,12 @@ class ApiException(
     val unauthorized: Boolean = false,
 ) : Exception(message)
 
+data class BridgeCapabilities(
+    val threadSettings: Boolean = false,
+    val approvalResponse: Boolean = false,
+    val attachments: Boolean = false,
+)
+
 class ApiClient(
     baseUrl: String,
     private val token: String? = null,
@@ -681,12 +687,9 @@ class ApiClient(
     suspend fun resolveApproval(requestId: Int, decision: String): ActionResponse = withTransport(
         cbdpCall = {
             CbdpMapper.actionResponse(
-                execute(
-                    CbdpMethod.APPROVAL_RESOLVE,
-                    listOf(
-                        CbdpTlv(CbdpTag.APPROVAL_REF, CbdpCodec.u32(requestId.toLong())),
-                        CbdpTlv(CbdpTag.DECISION, CbdpCodec.u8(decisionValue(decision))),
-                    ),
+                ensureCbdp().resolveApproval(
+                    approvalRef = requestId.toLong(),
+                    decision = decisionValue(decision),
                 ),
             )
         },
@@ -701,8 +704,81 @@ class ApiClient(
         },
     )
 
-    suspend fun respondApproval(requestId: Int, response: JsonObject): ActionResponse =
-        resolveApproval(requestId, response["decision"]?.jsonPrimitive?.content ?: "decline")
+    /**
+     * Approval ids are transport-specific: CBDP hands out a compact
+     * ``approval_ref`` and its APPROVAL_RESOLVE frame only carries MCP
+     * action/content, while Companion uses the real request id and can pass a
+     * full structured response. Never flatten an unsupported payload into a
+     * decline, because that silently discards the user's answers.
+     */
+    suspend fun respondApproval(requestId: Int, response: JsonObject): ActionResponse {
+        val action = response["action"]?.jsonPrimitive?.content.orEmpty()
+        val content = response["content"]?.toString().orEmpty()
+        if (resolveTransport() == Transport.CBDP) {
+            if (action.isBlank()) {
+                throw ApiException(
+                    "当前电脑端暂不支持提交这类审批内容，请更新电脑端",
+                    "structured_approval_unsupported",
+                )
+            }
+            val fields = buildList {
+                add(CbdpTlv(CbdpTag.MCP_ACTION, action.toByteArray(Charsets.UTF_8)))
+                if (content.isNotBlank()) {
+                    add(CbdpTlv(CbdpTag.MCP_CONTENT, content.toByteArray(Charsets.UTF_8)))
+                }
+            }
+            return CbdpMapper.actionResponse(
+                ensureCbdp().resolveApproval(
+                    approvalRef = requestId.toLong(),
+                    responseFields = fields,
+                ),
+            )
+        }
+        return json.decodeFromString(
+            ActionResponse.serializer(),
+            postText(
+                "/api/companion/approvals/$requestId",
+                buildJsonObject { put("response", response) },
+            ),
+        )
+    }
+
+    suspend fun bridgeCapabilities(): BridgeCapabilities =
+        runCatching {
+            parseCommandCatalog(
+                json.decodeFromString(JsonObject.serializer(), getText("/api/companion/protocol")),
+            )
+        }.getOrElse { BridgeCapabilities() }
+
+    suspend fun threadSettings(threadId: String): ThreadSettings =
+        json.decodeFromString(
+            ThreadSettings.serializer(),
+            command("thread.settings.read", buildJsonObject { put("thread_id", threadId) }),
+        )
+
+    suspend fun updateThreadSettings(
+        threadId: String,
+        model: String = "",
+        effort: String = "",
+        approvalPolicy: String = "",
+        sandboxPolicy: String = "",
+        approvalsReviewer: String = "",
+    ): ThreadSettings {
+        val payload = buildJsonObject {
+            put("thread_id", threadId)
+            if (model.isNotBlank()) put("model", model)
+            if (effort.isNotBlank()) put("effort", effort)
+            if (approvalPolicy.isNotBlank()) put("approval_policy", approvalPolicy)
+            if (sandboxPolicy.isNotBlank()) put("sandbox_policy", sandboxPolicy)
+            if (approvalsReviewer.isNotBlank()) put("approvals_reviewer", approvalsReviewer)
+        }
+        return requireAppliedThreadSettings(
+            json.decodeFromString(
+                ThreadSettings.serializer(),
+                command("thread.settings.update", payload),
+            ),
+        )
+    }
 
     private fun decisionValue(decision: String): Int = when (decision) {
         "accept", "approved", "approve" -> CbdpApprovalDecision.ACCEPT
@@ -850,4 +926,21 @@ class ApiClient(
             return (text.substring(0, schemeEnd) + host + ":$port" + tail).trimEnd('/')
         }
     }
+}
+
+internal fun requireAppliedThreadSettings(settings: ThreadSettings): ThreadSettings {
+    if (!settings.applied) throw ApiException("电脑端没有应用这次设置变更", "settings_not_applied")
+    return settings
+}
+
+internal fun parseCommandCatalog(catalog: JsonObject): BridgeCapabilities {
+    val methods = catalog["methods"] as? kotlinx.serialization.json.JsonArray ?: return BridgeCapabilities()
+    val names = methods.mapNotNull {
+        it.jsonObject["method"]?.jsonPrimitive?.content
+    }.toSet()
+    return BridgeCapabilities(
+        threadSettings = "thread.settings.update" in names,
+        approvalResponse = "approval.respond" in names,
+        attachments = "attachment.upload.begin" in names && "attachment.add" in names,
+    )
 }
