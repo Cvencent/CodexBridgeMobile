@@ -860,3 +860,83 @@ thread.read:
 **图片被 Codex 真实接收并正确识别颜色。手机端附件功能端到端全部完成。**
 
 测试附件已删除、测试线程保留（无副作用）、临时配对身份已撤销。
+
+## 16. 手机回复在桌面端不可见 + 回复中途停止（Bridge 2.1.16 实测）
+
+日期：2026-10-21
+
+### 用户现象
+
+1. 手机上回复一个桌面端正在使用的会话，Codex 的回复过了一会儿就停了。
+2. 电脑端 Codex 看不到手机输入的内容。
+3. 重启桌面 Codex 后能看到，但用户不想每次重启。
+
+### 实测复现
+
+用探针手机往一个桌面创建的空闲会话发消息：
+
+```text
+send 200, continued_as=null（没有 fork，走的是原线程）
+turn 正常完成，Codex 回复了 "pong"
+手机输入的内容和 Codex 的回复都在 thread.read 里
+```
+
+说明手机 → Bridge → 线程 rollouts 的写入链路本身是通的。
+
+但对一个**桌面 Codex 正在使用的活跃会话**（例如
+`01a15341` 检查表情渲染器预览状态）实测：
+
+- 用户在手机上发了 3 条"他说了"（因为没反应重试了 3 次），
+  3 条消息都进了线程 rollouts。
+- turn 卡死在 working，无 agent 回复。
+- `turn/interrupt` 返回 "no active turn to interrupt"——turn 已经死了，
+  working 是 rollout 活动分类器的残留。
+- 桌面端 Codex 完全看不到这 3 条消息。
+
+### 根因
+
+`_desktop_owner()` 在生产环境永远返回 `None`：
+
+```python
+# codexbridge/companion/service.py
+if self._desktop is None and self._client_factory is not None:
+    return None
+```
+
+`__main__.py` 构造 `CompanionService` 时传了
+`client_factory=lambda command, cwd: shared_app_server`，
+所以这个短路恒成立。
+
+结果：手机 turn 走的是 **Bridge 自己的 app-server**，不是桌面 Codex
+的 app-server。这导致：
+
+1. **桌面看不到手机消息**：桌面 Codex app 的 app-server 进程和 Bridge 的
+   app-server 进程是两个进程。手机 turn 写入了同一个 rollout 文件，
+   但桌面 Codex UI 不会自动重读——只有重启（或重新打开会话触发
+   re-hydrate）才看得到。
+2. **回复中途停止**：桌面 Codex app 也在同一个线程上持有 writer lock 和
+   内存状态。两个 app-server 进程同时操作一个线程会产生竞争：
+   Bridge 的 `_writable_thread` 清了桌面的 writer lock 后 resume，
+   桌面自己的 app-server 感知到后可能重新拿锁或写状态，把手机 turn
+   弄死。空闲会话没这个问题（我实测能完成），活跃会话必现。
+
+### 修复方向（Bridge）
+
+让 `_desktop_owner()` 在生产环境执行 DesktopIPC owner discovery，
+不要因为 `client_factory` 存在就短路。短路应该只针对测试隔离场景
+（例如加一个 `isolated=True` 构造参数）。
+
+修好后手机 turn 通过 `thread-follower-start-turn` 走桌面 Codex：
+
+- 桌面实时显示手机消息（是桌面自己的 turn）。
+- 只有一个 writer，不再竞争。
+- 手机流式输出来自桌面 turn，不会再中途停止。
+
+### 用户立即可用的 workaround（不重启 Codex）
+
+手机输入的内容**没有丢**，已经在 rollout 文件里。在桌面 Codex app 里
+切到另一个会话，再切回来——Codex 重新打开会话时会从磁盘 re-hydrate，
+手机消息就会显示。不需要重启整个 Codex。
+
+卡死的 working 状态会在 rollout 活动停止约 150 秒后自动清为 idle
+（`LOG_ACTIVE_SECONDS`），或者用户在手机上点中断也可以。
