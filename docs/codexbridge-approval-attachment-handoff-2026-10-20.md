@@ -795,3 +795,44 @@ failed，需要用最新 revision 重试。手机端已按返回的 revision 处
 - 附件 chip、上传进度、移除；
 - 只发图片不带文字；
 - 发送时构造 `input_parts`（text 在前，image 在后）。
+
+## 14. 真机（模拟器）端到端验证
+
+用 `emulator-5554`（codexbridge_api35 AVD）实际运行 App 完成验证。
+
+### 已验证通过
+
+1. 重装 release APK 后重新配对，连接本机 Bridge 2.1.15。
+2. 任务列表同步出 40 个任务。
+3. 打开会话后，输入框左侧出现"添加附件"按钮。
+4. 点击按钮打开系统文件选择器（Documents UI）。
+5. 推送一张 PNG 到 `/sdcard/Pictures/`，在 Images 分类里能看到并选中。
+6. 选中后聊天输入框上方出现 `probe.png` 附件 chip。
+7. 点击发送：chip 消失，消息进入待发送队列。
+8. Bridge 端 `attachments/index.json` 出现真实记录：
+   `att_cce014f9c862e79baa584fe7 probe.png 264`。
+   说明手机 → Bridge 的上传、存储、绑线程全部真实成功。
+
+### 确认了 Bridge 侧最后一个缺口
+
+队列项最终 failed，错误与之前预判一致：
+
+```text
+队列已暂停：App Server 请求失败 turn/start：
+Invalid request: unknown variant `input_image`,
+expected one of `text`, `image`, `localImage`, `audio`, `localAudio`,
+`skill`, `mention`
+```
+
+这证实手机端整个附件链路（选图 → 上传 → 存储 → input_parts → 发消息）
+全部正确，最后一步只等 Bridge 把 `_codex_inputs()` 里的
+`{"type":"input_image","image_url":...}` 改成
+`{"type":"image","url":...}`（或 `localImage`/`path`）。
+
+Bridge 修复这一处后，手机端不需要任何改动，图片就能真正进入 Codex。
+
+### 手机端配套发现并修复
+
+- 附件按钮的可见性只依赖能力协商结果，不再要求当前会话可写（和桌面端
+  行为一致：无写权限时可以看到按钮，提交时才被拒）。
+- 重装后首次打开会话就能触发能力协商，不依赖任何手工刷新。

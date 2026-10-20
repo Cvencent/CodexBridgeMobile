@@ -373,7 +373,7 @@ fun ChatScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.Bottom,
             ) {
-                if (state.bridgeCapabilities.attachments && state.canWrite) {
+                if (state.bridgeCapabilities.attachments) {
                     IconButton(
                         onClick = onPickAttachments,
                         enabled = !state.sending,

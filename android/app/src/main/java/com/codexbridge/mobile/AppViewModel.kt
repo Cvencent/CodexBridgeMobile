@@ -672,6 +672,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 observeThread(threadId)
                 refreshWriterState(threadId)
+                refreshBridgeCapabilities(threadId)
+                refreshThreadSettings(threadId)
             } catch (error: Exception) {
                 _state.update { it.copy(busy = false) }
                 handleError(error)
@@ -1842,8 +1844,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun refreshBridgeCapabilities(threadId: String = "") {
         val client = api ?: return
         viewModelScope.launch {
-            client.declareSupportedCapabilities()
-            runCatching { client.bridgeCapabilities(threadId) }
+            val enabled = client.declareSupportedCapabilities()
+            runCatching { client.bridgeCapabilities(threadId, enabled) }
                 .onSuccess { capabilities ->
                     _state.update { it.copy(bridgeCapabilities = capabilities) }
                 }
