@@ -1126,8 +1126,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // the app-server reject it (experimentalApi). Drop the
                 // capability so the switch stops being offered, instead of
                 // leaving a control that always fails.
-                val unsupported = error is ApiException &&
-                    error.message?.contains("experimentalApi", ignoreCase = true) == true
+                val text = (error as? ApiException)?.message.orEmpty()
+                // Only a genuinely unsupported bridge hides the control.
+                // "thread not found" means this particular thread is owned by
+                // the desktop and the bridge can't route settings to it yet;
+                // other threads on the same bridge still work.
+                val unsupported = text.contains("experimentalApi", ignoreCase = true) ||
+                    text.contains("requires experimentalApi", ignoreCase = true) ||
+                    text.contains("thread/settings/update", ignoreCase = true) &&
+                    text.contains("unsupported", ignoreCase = true)
+                val desktopOwned = text.contains("thread not found", ignoreCase = true)
                 _state.update {
                     it.copy(
                         approvalMode = previous,
@@ -1142,6 +1150,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (unsupported) {
                     _state.update {
                         it.copy(error = "当前电脑端暂不支持切换审批模式，请更新电脑端")
+                    }
+                } else if (desktopOwned) {
+                    _state.update {
+                        it.copy(error = "这个会话由桌面端持有，暂时无法从手机切换审批模式；手机新建的会话可以")
                     }
                 } else {
                     handleError(error)

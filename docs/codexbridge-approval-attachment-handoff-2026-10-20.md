@@ -654,3 +654,74 @@ thread.settings.update -> 503
 `attachment.upload.begin/chunk/end`、`attachment.add`、
 `input.capabilities.read`、`content.read` 在命令目录里都不存在，
 手机端继续隐藏图片/文件入口。
+
+## 12. 复测结果（Bridge 2.1.14）
+
+### 已修复并验证通过
+
+**1. 手机新建会话的审批模式：写入 + 读回都正常**
+
+```text
+thread.start            -> 200
+thread.settings.update  -> 200 {"applied":true,"settings_revision":1}
+   params: approval_policy=never, sandbox_policy=danger-full-access
+thread.settings.read    -> 200
+   {"approval_policy":"never","sandbox_policy":"danger-full-access",
+    "settings_revision":1}
+thread.settings.update  -> 200 {"applied":true,"settings_revision":2}  # 切回
+```
+
+`_thread_settings_snapshot` 生效，读回不再返回空字符串。手机端可以正确
+恢复上次选择的模式。
+
+### 仍需 Bridge 修复：桌面持有的线程改不了设置
+
+实测同一个桌面会话：
+
+```text
+thread.settings.update -> 503
+"App Server 调用失败 thread/settings/update：thread not found: <thread_id>"
+```
+
+根因（已定位到具体代码）：
+
+`CompanionService._desktop_owner()` 开头有：
+
+```python
+# Custom app-server factories are isolated from the user's live desktop.
+if self._desktop is None and self._client_factory is not None:
+    return None
+```
+
+但生产环境的 `CompanionService` 构造时传了
+`client_factory=lambda command, cwd: shared_app_server`（见
+`codexbridge/__main__.py` 的 `CompanionService(...)`），所以
+`_desktop_owner()` 永远直接返回 `None`，永远发现不到桌面 owner。
+
+`start_turn` 之所以能写桌面线程，是因为它在 owner 判定之后还有
+`_writable_thread()` 重新挂载线程；而 `update_thread_settings` 只依赖
+`_desktop_owner()`，拿不到 owner 就直接落到 Bridge 自己的 app-server，
+于是报 `thread not found`。
+
+修复方向（二选一）：
+
+- 让 `_desktop_owner()` 只在"确实要隔离的测试工厂"时短路，生产环境
+  （共享 desktop app-server）仍然执行 DesktopIPC owner discovery；或
+- `update_thread_settings` 复用 `start_turn` 的路径：先
+  `_writable_thread(thread_id)` 挂载/回收，再更新设置。
+
+注意第二条要谨慎：`_writable_thread` 会改动 writer lock，属于写操作，
+仅为了改设置就回收桌面会话可能不合适，建议优先走第一条。
+
+### 附件仍然未实现
+
+Bridge 2.1.14 的命令目录里仍然没有：
+
+```text
+attachment.upload.begin / chunk / end
+attachment.add / list / remove
+input.capabilities.read
+content.read
+```
+
+手机端继续隐藏图片/文件入口。
