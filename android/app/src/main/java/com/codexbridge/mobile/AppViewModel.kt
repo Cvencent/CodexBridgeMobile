@@ -10,6 +10,7 @@ import com.codexbridge.mobile.data.Account
 import com.codexbridge.mobile.data.ApiClient
 import com.codexbridge.mobile.data.ApiException
 import com.codexbridge.mobile.data.BridgeCapabilities
+import com.codexbridge.mobile.data.PendingAttachment
 import com.codexbridge.mobile.data.ConnectionRoute
 import com.codexbridge.mobile.data.ConnectionSelector
 import com.codexbridge.mobile.data.cbdp.CbdpTag
@@ -106,6 +107,7 @@ data class UiState(
         com.codexbridge.mobile.data.cbdp.ApprovalMode.RequestApproval,
     val approvalModeChanging: Boolean = false,
     val bridgeCapabilities: BridgeCapabilities = BridgeCapabilities(),
+    val pendingAttachments: List<PendingAttachment> = emptyList(),
     val ownerState: String = "",
     val leaseGeneration: Long = 0,
     val deviceRef: String = "",
@@ -803,7 +805,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         val threadId = _state.value.activeThread?.thread_id ?: return
         val content = text.trim()
-        if (content.isEmpty()) return
+        val pending = _state.value.pendingAttachments
+        if (content.isEmpty() && pending.isEmpty()) return
         if (!_state.value.canWrite) {
             _state.update { it.copy(error = "当前线程没有写入权限，请先接管线程") }
             return
@@ -812,15 +815,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(error = null, sending = true) }
         viewModelScope.launch {
             try {
+                val uploaded = mutableListOf<com.codexbridge.mobile.data.UploadedAttachment>()
+                for (item in pending) {
+                    val existing = item.uploaded
+                    if (existing != null) {
+                        uploaded += existing
+                        continue
+                    }
+                    val bytes = withContext(Dispatchers.IO) { readAttachmentBytes(item.uri) }
+                    if (bytes == null) {
+                        throw ApiException("无法读取附件：" + item.filename, "attachment_read_failed")
+                    }
+                    updateAttachment(item.localId) { it.copy(state = com.codexbridge.mobile.data.AttachmentState.Uploading) }
+                    val result = client.uploadAttachment(
+                        threadId = threadId,
+                        kind = item.kind,
+                        filename = item.filename,
+                        mimeType = item.mimeType,
+                        bytes = bytes,
+                        onProgress = { done ->
+                            updateAttachment(item.localId) { it.copy(uploadedBytes = done) }
+                        },
+                    )
+                    uploaded += result
+                    updateAttachment(item.localId) {
+                        it.copy(state = com.codexbridge.mobile.data.AttachmentState.Uploaded, uploaded = result)
+                    }
+                }
+                val parts = com.codexbridge.mobile.data.attachmentInputParts(content, uploaded)
                 client.sendMessage(
                     threadId = threadId,
                     text = content,
                     model = _state.value.selectedModel,
                     effort = _state.value.selectedEffort,
+                    inputParts = parts,
                 )
+                _state.update { it.copy(pendingAttachments = emptyList()) }
                 refreshQueue(threadId)
-                // The bridge owns dispatch. A fresh thread starts immediately;
-                // a busy thread stays pending until its turn completes.
                 runCatching { client.thread(threadId) }.onSuccess { detail ->
                     val status = coherentTaskStatus(
                         _state.value.activeThread?.status.orEmpty(),
@@ -834,11 +865,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } catch (error: Exception) {
-                _state.update { it.copy(restoreInput = content, sending = false) }
+                _state.update { state ->
+                    state.copy(
+                        restoreInput = if (content.isNotEmpty()) content else state.restoreInput,
+                        sending = false,
+                        pendingAttachments = state.pendingAttachments.map { item ->
+                            if (item.state == com.codexbridge.mobile.data.AttachmentState.Uploading) {
+                                item.copy(state = com.codexbridge.mobile.data.AttachmentState.Failed)
+                            } else {
+                                item
+                            }
+                        },
+                    )
+                }
                 handleError(error)
             }
         }
     }
+
+    private fun updateAttachment(
+        localId: String,
+        transform: (com.codexbridge.mobile.data.PendingAttachment) -> com.codexbridge.mobile.data.PendingAttachment,
+    ) {
+        _state.update { state ->
+            state.copy(
+                pendingAttachments = state.pendingAttachments.map { item ->
+                    if (item.localId == localId) transform(item) else item
+                },
+            )
+        }
+    }
+
+    private fun readAttachmentBytes(uri: String): ByteArray? =
+        runCatching {
+            getApplication<Application>().contentResolver
+                .openInputStream(android.net.Uri.parse(uri))
+                ?.use { it.readBytes() }
+        }.getOrNull()
 
     fun steerQueue(item: QueueItem) {
         val client = api ?: return
@@ -1084,6 +1147,72 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { handleError(it) }
+        }
+    }
+
+    fun addAttachments(items: List<com.codexbridge.mobile.data.PendingAttachment>) {
+        if (items.isEmpty()) return
+        if (!_state.value.bridgeCapabilities.attachments) {
+            _state.update { it.copy(error = "电脑端暂不支持附件，请更新电脑端") }
+            return
+        }
+        _state.update { state ->
+            val existing = state.pendingAttachments
+            val room = (com.codexbridge.mobile.data.MAX_ATTACHMENTS_PER_THREAD - existing.size)
+                .coerceAtLeast(0)
+            state.copy(pendingAttachments = existing + items.take(room))
+        }
+    }
+
+    fun addPickedAttachments(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        val resolver = getApplication<Application>().contentResolver
+        val added = uris.mapNotNull { uri ->
+            runCatching {
+                val mime = resolver.getType(uri) ?: "application/octet-stream"
+                var name = ""
+                var size = 0L
+                resolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                        if (nameIndex >= 0) name = cursor.getString(nameIndex).orEmpty()
+                        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+                    }
+                }
+                if (size <= 0) {
+                    size = resolver.openInputStream(uri)?.use { it.available().toLong() } ?: 0L
+                }
+                if (size > com.codexbridge.mobile.data.MAX_ATTACHMENT_BYTES) return@runCatching null
+                val kind = if (mime.startsWith("image/")) "image" else "file"
+                com.codexbridge.mobile.data.PendingAttachment(
+                    localId = java.util.UUID.randomUUID().toString(),
+                    uri = uri.toString(),
+                    filename = name.ifBlank { "附件" },
+                    mimeType = mime,
+                    kind = kind,
+                    byteSize = size,
+                )
+            }.getOrNull()
+        }
+        if (added.isEmpty()) {
+            _state.update { it.copy(error = "没有可发送的附件，或附件超过 32 MiB") }
+            return
+        }
+        if (!_state.value.bridgeCapabilities.attachments) {
+            _state.update { it.copy(error = "电脑端暂不支持附件，请更新电脑端") }
+            return
+        }
+        _state.update { state ->
+            val room = (com.codexbridge.mobile.data.MAX_ATTACHMENTS_PER_THREAD - state.pendingAttachments.size)
+                .coerceAtLeast(0)
+            state.copy(pendingAttachments = state.pendingAttachments + added.take(room))
+        }
+    }
+
+    fun removeAttachment(localId: String) {
+        _state.update { state ->
+            state.copy(pendingAttachments = state.pendingAttachments.filterNot { it.localId == localId })
         }
     }
 
@@ -1713,6 +1842,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun refreshBridgeCapabilities(threadId: String = "") {
         val client = api ?: return
         viewModelScope.launch {
+            client.declareSupportedCapabilities()
             runCatching { client.bridgeCapabilities(threadId) }
                 .onSuccess { capabilities ->
                     _state.update { it.copy(bridgeCapabilities = capabilities) }

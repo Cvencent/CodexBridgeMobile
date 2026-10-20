@@ -725,3 +725,73 @@ content.read
 ```
 
 手机端继续隐藏图片/文件入口。
+
+## 13. 附件接入复测（Bridge 2.1.15）
+
+按 `CodexBridge-mobile-attachment-api.md` 完成手机端接入，并用临时配对身份
+对本地 Bridge 做了真实上传与发送验证。
+
+### 验证通过
+
+```text
+POST /api/companion/capabilities
+  -> enabled [approval, attachment, control, queue, status, tasks]
+POST /threads/<id>/attachments          -> 201, upload_id
+POST /uploads/<upload_id>/chunk         -> 200, offset 前进
+POST /uploads/<upload_id>/end           -> 200, attachment_id + content_ref
+GET  /threads/<id>/attachments          -> 200, 列表包含该附件
+POST /threads/<id>/messages (input_parts)-> 200, 队列项带 input_parts
+```
+
+三步上传、附件列表、带图片发消息的**协议链路都是通的**。
+
+### 仍需 Bridge 修复：图片输入类型写错，Codex 拒收
+
+实际执行时队列项变成 failed：
+
+```text
+App Server 调用失败 turn/start：
+Invalid request: unknown variant `input_image`,
+expected one of `text`, `image`, `localImage`, `audio`, `localAudio`
+```
+
+根因在 `codexbridge/companion/service.py` 的 `_codex_inputs()`：
+
+```python
+result.append(
+    {
+        "type": "input_image",       # ← app-server 不认这个
+        "image_url": self.attachments.data_url(record.attachment_id),
+        "detail": ...,
+    }
+)
+```
+
+app-server 的 `UserInput` 只接受：
+
+```json
+{"type": "image", "url": "data:image/png;base64,..."}
+```
+
+或本地路径形式：
+
+```json
+{"type": "localImage", "path": "C:\\...\\x.png"}
+```
+
+所以应改为 `{"type": "image", "url": ...}`（字段名是 `url`，不是
+`image_url`），或者先把内容落盘再用 `localImage`。
+
+### 另一处（次要）
+
+`queue.delete` 用队列项当前 `revision` 删除时，第一次成功；如果队列项已经
+failed，需要用最新 revision 重试。手机端已按返回的 revision 处理。
+
+### 手机端已实现
+
+- 配对后主动声明 `attachment` 能力；
+- 三步上传（2 MiB 分片、base64、绝对 offset）；
+- 真正的 32 MiB / 64 个每线程上限校验；
+- 附件 chip、上传进度、移除；
+- 只发图片不带文字；
+- 发送时构造 `input_parts`（text 在前，image 在后）。

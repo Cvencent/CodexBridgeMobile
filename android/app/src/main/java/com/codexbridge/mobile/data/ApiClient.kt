@@ -32,9 +32,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -462,23 +464,118 @@ class ApiClient(
         text: String,
         model: String = "",
         effort: String = "",
+        inputParts: List<Map<String, Any>> = emptyList(),
     ): SendResponse = withTransport(
-        cbdpCall = { cbdpSendMessage(threadId, text, model, effort) },
-        companionCall = {
-            json.decodeFromString(
-                SendResponse.serializer(),
-                postText(
-                    "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/messages",
-                    buildJsonObject {
-                        put("text", text)
-                        put("model", model)
-                        put("effort", effort)
-                        put("mode", "start")
-                    },
-                ),
-            )
+        cbdpCall = {
+            if (inputParts.isEmpty()) {
+                cbdpSendMessage(threadId, text, model, effort)
+            } else {
+                // Attachments travel through the Companion REST route: it is
+                // the path the Bridge documents for input_parts and it applies
+                // the same attachment validation regardless of CBDP support.
+                postCompanionMessage(threadId, text, model, effort, inputParts)
+            }
         },
+        companionCall = { postCompanionMessage(threadId, text, model, effort, inputParts) },
     )
+
+    private suspend fun postCompanionMessage(
+        threadId: String,
+        text: String,
+        model: String,
+        effort: String,
+        inputParts: List<Map<String, Any>>,
+    ): SendResponse = json.decodeFromString(
+        SendResponse.serializer(),
+        postText(
+            "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/messages",
+            buildJsonObject {
+                if (text.isNotBlank()) put("text", text)
+                if (model.isNotBlank()) put("model", model)
+                if (effort.isNotBlank()) put("effort", effort)
+                put("mode", "start")
+                if (inputParts.isNotEmpty()) {
+                    put("input_parts", buildJsonArray {
+                        inputParts.forEach { part ->
+                            add(buildJsonObject {
+                                part.forEach { (key, value) ->
+                                    if (value is String) put(key, value)
+                                }
+                            })
+                        }
+                    })
+                }
+            },
+        ),
+    )
+
+    /**
+     * Upload a finished file through the Companion three-step flow.
+     * Chunks are base64 JSON bodies; offsets are absolute and must match the
+     * Bridge progress exactly or the call returns UPLOAD_OFFSET_MISMATCH.
+     */
+    suspend fun uploadAttachment(
+        threadId: String,
+        kind: String,
+        filename: String,
+        mimeType: String,
+        bytes: ByteArray,
+        onProgress: (uploaded: Long) -> Unit = {},
+    ): UploadedAttachment {
+        require(bytes.isNotEmpty()) { "attachment is empty" }
+        require(bytes.size.toLong() <= MAX_ATTACHMENT_BYTES) { "attachment is larger than 32 MiB" }
+        val begin = postJson(
+            "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/attachments",
+            buildJsonObject {
+                put("kind", kind)
+                put("byte_size", bytes.size)
+                put("filename", filename)
+                put("mime_type", mimeType)
+            },
+        )
+        val uploadId = begin["upload_id"]?.jsonPrimitive?.content.orEmpty()
+        if (uploadId.isBlank()) throw ApiException("电脑端没有返回 upload_id", "invalid_upload")
+        var uploaded = 0L
+        for ((offset, length) in attachmentChunkPlan(bytes.size.toLong())) {
+            val chunk = bytes.copyOfRange(offset.toInt(), offset.toInt() + length)
+            val encoded = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
+            val response = postJson(
+                "/api/companion/uploads/" + java.net.URLEncoder.encode(uploadId, "UTF-8") + "/chunk",
+                buildJsonObject {
+                    put("offset", offset)
+                    put("data", encoded)
+                },
+            )
+            uploaded = response["upload_offset"]?.jsonPrimitive?.longOrNull ?: (offset + length)
+            onProgress(uploaded)
+        }
+        val end = postJson(
+            "/api/companion/uploads/" + java.net.URLEncoder.encode(uploadId, "UTF-8") + "/end",
+            buildJsonObject { put("byte_size", bytes.size) },
+        )
+        val attachmentId = end["attachment_id"]?.jsonPrimitive?.content.orEmpty()
+        if (attachmentId.isBlank()) throw ApiException("电脑端没有返回 attachment_id", "invalid_upload")
+        return UploadedAttachment(
+            attachmentId = attachmentId,
+            contentRef = end["content_ref"]?.jsonPrimitive?.content.orEmpty(),
+            kind = end["kind"]?.jsonPrimitive?.content ?: kind,
+            filename = end["filename"]?.jsonPrimitive?.content ?: filename,
+            mimeType = end["mime_type"]?.jsonPrimitive?.content ?: mimeType,
+            byteSize = end["byte_size"]?.jsonPrimitive?.longOrNull ?: bytes.size.toLong(),
+        )
+    }
+
+    suspend fun cancelUpload(uploadId: String) {
+        runCatching {
+            postJson(
+                "/api/companion/uploads/" + java.net.URLEncoder.encode(uploadId, "UTF-8") + "/cancel",
+                buildJsonObject { },
+            )
+        }
+    }
+
+    private suspend fun postJson(path: String, payload: JsonObject): JsonObject =
+        json.decodeFromString(JsonObject.serializer(), postText(path, payload))
 
     private suspend fun cbdpSendMessage(
         threadId: String,
@@ -749,6 +846,25 @@ class ApiClient(
      * (for example \`thread/settings/update\` needs experimentalApi), so the
      * UI must probe the read path before offering the approval switch.
      */
+    /**
+     * Ask the Bridge to enable attachment for this phone. Phones paired before
+     * the attachment capability existed default to the older set, so the app
+     * negotiates explicitly instead of relying on the pairing-time defaults.
+     */
+    suspend fun declareSupportedCapabilities() {
+        runCatching {
+            postJson(
+                "/api/companion/capabilities",
+                buildJsonObject {
+                    put("supported", buildJsonArray {
+                        listOf("status", "tasks", "control", "approval", "queue", "attachment")
+                            .forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) }
+                    })
+                },
+            )
+        }
+    }
+
     suspend fun bridgeCapabilities(threadId: String = ""): BridgeCapabilities {
         val listed = runCatching {
             parseCommandCatalog(

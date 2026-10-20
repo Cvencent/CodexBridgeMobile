@@ -20,10 +20,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Warning
@@ -87,6 +90,8 @@ fun ChatScreen(
     onResolveApproval: (Int, String) -> Unit,
     onRespondApproval: (Int, JsonObject) -> Unit,
     onSetApprovalMode: (com.codexbridge.mobile.data.cbdp.ApprovalMode) -> Unit = {},
+    onPickAttachments: () -> Unit = {},
+    onRemoveAttachment: (String) -> Unit = {},
     onSteerQueue: (QueueItem) -> Unit = {},
     onEditQueue: (QueueItem, String) -> Unit = { _, _ -> },
     onDeleteQueue: (QueueItem) -> Unit = {},
@@ -336,10 +341,46 @@ fun ChatScreen(
                     )
                 }
             }
+            if (state.pendingAttachments.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    state.pendingAttachments.forEach { item ->
+                        AssistChip(
+                            onClick = { onRemoveAttachment(item.localId) },
+                            label = {
+                                Text(
+                                    text = when (item.state) {
+                                        com.codexbridge.mobile.data.AttachmentState.Uploading ->
+                                            item.filename + " " + progressPercent(item) + "%"
+                                        com.codexbridge.mobile.data.AttachmentState.Failed ->
+                                            item.filename + " 失败"
+                                        else -> item.filename
+                                    },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.Bottom,
             ) {
+                if (state.bridgeCapabilities.attachments && state.canWrite) {
+                    IconButton(
+                        onClick = onPickAttachments,
+                        enabled = !state.sending,
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = "添加附件")
+                    }
+                }
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
@@ -355,12 +396,13 @@ fun ChatScreen(
                 IconButton(
                     onClick = {
                         val text = input.trim()
-                        if (text.isNotEmpty()) {
+                        if (text.isNotEmpty() || state.pendingAttachments.isNotEmpty()) {
                             input = ""
                             onSend(text)
                         }
                     },
-                    enabled = state.canWrite && input.isNotBlank() && !state.sending,
+                    enabled = state.canWrite && !state.sending &&
+                        (input.isNotBlank() || state.pendingAttachments.isNotEmpty()),
                     modifier = Modifier
                         .size(48.dp)
                         .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
@@ -1050,6 +1092,11 @@ private fun ApprovalCard(
             }
         }
     }
+}
+
+private fun progressPercent(item: com.codexbridge.mobile.data.PendingAttachment): Int {
+    if (item.byteSize <= 0) return 0
+    return ((item.uploadedBytes * 100) / item.byteSize).toInt().coerceIn(0, 100)
 }
 
 private fun commandFooter(status: String, exitCode: Int?, durationMs: Long?): String {

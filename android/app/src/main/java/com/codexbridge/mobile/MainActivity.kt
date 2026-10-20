@@ -11,6 +11,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -104,6 +107,12 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val attachmentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isNotEmpty()) viewModel.addPickedAttachments(uris)
+    }
+
 
     LaunchedEffect(state.error, state.notice) {
         val message = state.error ?: state.notice
@@ -150,6 +159,10 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 onResolveApproval = viewModel::resolveApproval,
                 onRespondApproval = viewModel::respondApproval,
                 onSetApprovalMode = viewModel::setApprovalMode,
+                onPickAttachments = {
+                    attachmentLauncher.launch(arrayOf("image/*", "application/pdf", "text/*", "application/octet-stream"))
+                },
+                onRemoveAttachment = viewModel::removeAttachment,
                 onSteerQueue = viewModel::steerQueue,
                 onEditQueue = viewModel::editQueue,
                 onDeleteQueue = viewModel::deleteQueue,
