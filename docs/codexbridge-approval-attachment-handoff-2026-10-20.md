@@ -544,3 +544,60 @@ Bridge 侧建议优先检查：
    建议先用 `mention`，并在不支持时明确失败。
 5. 运行中的 turn 是否允许切换审批模式？建议只允许空闲时切换，或明确
    标注“下一轮生效”。
+
+## 10. 本机实测结果（2026-10-20，Bridge 2.1.11）
+
+用临时配对身份直连本机 Bridge（8568）做协议级验证，结果如下。
+
+### 已修复并验证通过
+
+- `POST /api/companion/approvals/<request_id>` 路由已改为 4 段判断，不再返回
+  404。传入不存在的审批 id 会返回 `200 {"ok":true,"resolved":false}`，
+  说明请求确实进入了处理器。
+- 命令目录 `GET /api/companion/protocol` 已暴露
+  `thread.settings.read`、`thread.settings.update`、`approval.respond`、
+  `approval.resolve`。
+- `thread.settings.read` 正常返回。
+
+### 仍需 Bridge 修复：`thread.settings.update` 在 app-server 线程上失败
+
+实测（Bridge 2.1.11）：
+
+1. 只发 `approval_policy=never`：
+
+```text
+HTTP 503 {"error":"codex_unavailable",
+"message":"App Server 调用失败 thread/settings/update：
+thread/settings/update requires experimentalApi capability"}
+```
+
+2. 只发 `sandbox_policy="danger-full-access"`：
+
+```text
+HTTP 503 {"error":"codex_unavailable",
+"message":"App Server 调用失败 thread/settings/update：
+Invalid request: invalid type: string \"danger-full-access\",
+expected internally tagged enum SandboxPolicyDeserialize"}
+```
+
+3. 发送对象形式 `sandbox_policy={"type":"dangerFullAccess"}`：被命令层拒绝，
+返回 `400 invalid_params`。
+
+结论：
+
+- `codexbridge/codex/app_server.py` 的 `initialize` 只发送了 `clientInfo`，
+  没有声明 `capabilities.experimentalApi=true`，所以 app-server 直接拒绝
+  `thread/settings/update`。需要补上能力声明。
+- `sandbox_policy` 在 app-server 协议里是内部标记枚举对象
+  （`{"type":"dangerFullAccess" | "readOnly" | "workspaceWrite"}`），不是
+  字符串 `danger-full-access`。Bridge 需要在
+  `update_thread_settings` 里做映射，并放开命令层对该字段的对象类型校验。
+- 桌面持有的线程（`_desktop_followed` 路径）走
+  `thread-follower-update-thread-settings`，参数名是 `sandboxPolicy`，字符串
+  形式；两条路径需要分别处理，不能共用一个字符串直传。
+
+### 未实现
+
+- 附件命令（`attachment.upload.begin/chunk/end`、`attachment.add`、
+  `content.read`、`input.capabilities.read`）在本机目录里都不存在。
+  手机端已据此隐藏图片/文件入口，等 Bridge 实现后会自动出现。

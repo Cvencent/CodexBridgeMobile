@@ -1122,10 +1122,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }.onFailure { error ->
+                // A bridge can advertise thread.settings.update yet still have
+                // the app-server reject it (experimentalApi). Drop the
+                // capability so the switch stops being offered, instead of
+                // leaving a control that always fails.
+                val unsupported = error is ApiException &&
+                    error.message?.contains("experimentalApi", ignoreCase = true) == true
                 _state.update {
-                    it.copy(approvalMode = previous, approvalModeChanging = false)
+                    it.copy(
+                        approvalMode = previous,
+                        approvalModeChanging = false,
+                        bridgeCapabilities = if (unsupported) {
+                            it.bridgeCapabilities.copy(threadSettings = false)
+                        } else {
+                            it.bridgeCapabilities
+                        },
+                    )
                 }
-                handleError(error)
+                if (unsupported) {
+                    _state.update {
+                        it.copy(error = "当前电脑端暂不支持切换审批模式，请更新电脑端")
+                    }
+                } else {
+                    handleError(error)
+                }
             }
         }
     }
@@ -1678,10 +1698,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun refreshBridgeCapabilities() {
+    private fun refreshBridgeCapabilities(threadId: String = "") {
         val client = api ?: return
         viewModelScope.launch {
-            runCatching { client.bridgeCapabilities() }
+            runCatching { client.bridgeCapabilities(threadId) }
                 .onSuccess { capabilities ->
                     _state.update { it.copy(bridgeCapabilities = capabilities) }
                 }

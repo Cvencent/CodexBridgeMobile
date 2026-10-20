@@ -743,12 +743,22 @@ class ApiClient(
         )
     }
 
-    suspend fun bridgeCapabilities(): BridgeCapabilities =
-        runCatching {
+    /**
+     * Capabilities come from the live command catalog *and* from a real read.
+     * A command that is merely listed can still be rejected by the app-server
+     * (for example \`thread/settings/update\` needs experimentalApi), so the
+     * UI must probe the read path before offering the approval switch.
+     */
+    suspend fun bridgeCapabilities(threadId: String = ""): BridgeCapabilities {
+        val listed = runCatching {
             parseCommandCatalog(
                 json.decodeFromString(JsonObject.serializer(), getText("/api/companion/protocol")),
             )
         }.getOrElse { BridgeCapabilities() }
+        if (!listed.threadSettings || threadId.isBlank()) return listed
+        val readable = runCatching { threadSettings(threadId) }.isSuccess
+        return listed.copy(threadSettings = readable)
+    }
 
     suspend fun threadSettings(threadId: String): ThreadSettings =
         json.decodeFromString(
