@@ -32,6 +32,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
@@ -851,8 +852,8 @@ class ApiClient(
      * the attachment capability existed default to the older set, so the app
      * negotiates explicitly instead of relying on the pairing-time defaults.
      */
-    suspend fun declareSupportedCapabilities() {
-        runCatching {
+    suspend fun declareSupportedCapabilities(): Set<String> = runCatching {
+        parseEnabledCapabilities(
             postJson(
                 "/api/companion/capabilities",
                 buildJsonObject {
@@ -862,18 +863,30 @@ class ApiClient(
                     })
                 },
             )
-        }
-    }
+        )
+    }.getOrDefault(emptySet())
 
-    suspend fun bridgeCapabilities(threadId: String = ""): BridgeCapabilities {
+    suspend fun bridgeCapabilities(
+        threadId: String = "",
+        enabledCapabilities: Set<String> = emptySet(),
+    ): BridgeCapabilities {
         val listed = runCatching {
             parseCommandCatalog(
                 json.decodeFromString(JsonObject.serializer(), getText("/api/companion/protocol")),
             )
         }.getOrElse { BridgeCapabilities() }
-        if (!listed.threadSettings || threadId.isBlank()) return listed
-        val readable = runCatching { threadSettings(threadId) }.isSuccess
-        return listed.copy(threadSettings = readable)
+        // Attachment is a REST capability, not a command-catalog entry, so it
+        // only appears in the /capabilities negotiation result.
+        val attachments = listed.attachments ||
+            enabledCapabilities.contains("attachment") ||
+            enabledCapabilities.contains("file_reference") ||
+            enabledCapabilities.contains("image_input")
+        val settings = if (!listed.threadSettings || threadId.isBlank()) {
+            listed.threadSettings
+        } else {
+            runCatching { threadSettings(threadId) }.isSuccess
+        }
+        return listed.copy(threadSettings = settings, attachments = attachments)
     }
 
     suspend fun threadSettings(threadId: String): ThreadSettings =
@@ -1069,4 +1082,11 @@ internal fun parseCommandCatalog(catalog: JsonObject): BridgeCapabilities {
         approvalResponse = "approval.respond" in names,
         attachments = "attachment.upload.begin" in names && "attachment.add" in names,
     )
+}
+
+internal fun parseEnabledCapabilities(envelope: JsonObject): Set<String> {
+    val items = envelope["enabled"] as? kotlinx.serialization.json.JsonArray ?: return emptySet()
+    return items.mapNotNull { item ->
+        (item as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+    }.toSet()
 }

@@ -53,4 +53,25 @@ class AttachmentApiTest {
         assertEquals(1, parts.size)
         assertEquals("image", parts[0]["type"])
     }
+
+    @Test
+    fun attachmentFlagComesFromCapabilityNegotiation() {
+        val enabled = parseEnabledCapabilities(
+            kotlinx.serialization.json.Json.parseToJsonElement(
+                """{"ok":true,"enabled":["approval","attachment","control","queue","status","tasks"]}"""
+            ) as kotlinx.serialization.json.JsonObject,
+        )
+        assertTrue(enabled.contains("attachment"))
+        assertTrue(enabled.contains("control"))
+    }
+
+    @Test
+    fun attachmentFlagAbsentWhenNotNegotiated() {
+        val enabled = parseEnabledCapabilities(
+            kotlinx.serialization.json.Json.parseToJsonElement(
+                """{"ok":true,"enabled":["approval","control"]}"""
+            ) as kotlinx.serialization.json.JsonObject,
+        )
+        assertTrue(!enabled.contains("attachment"))
+    }
 }
