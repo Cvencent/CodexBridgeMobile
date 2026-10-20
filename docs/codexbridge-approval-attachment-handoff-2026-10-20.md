@@ -836,3 +836,27 @@ Bridge 修复这一处后，手机端不需要任何改动，图片就能真正�
 - 附件按钮的可见性只依赖能力协商结果，不再要求当前会话可写（和桌面端
   行为一致：无写权限时可以看到按钮，提交时才被拒）。
 - 重装后首次打开会话就能触发能力协商，不依赖任何手工刷新。
+
+## 15. 图片进模型最终验证（Bridge 2.1.16，全部通过）
+
+Bridge 修复 `_codex_inputs()` 后（`input_image/image_url` →
+`image/url`），用全新配对身份做了完整回归：
+
+```text
+POST /capabilities                      -> enabled 含 attachment
+POST /threads                           -> 新线程
+POST /threads/<id>/attachments          -> 201 upload_id
+POST /uploads/<id>/chunk                -> 200
+POST /uploads/<id>/end                  -> 200 attachment_id
+POST /threads/<id>/messages (input_parts)-> 200
+   text: "What color is this image? Answer with one word."
+   input_parts: [text, image(green 8x8 PNG)]
+等待 Codex 处理 ->
+thread.read:
+  user  | What color is this image? Answer with one word.
+  agent | Green
+```
+
+**图片被 Codex 真实接收并正确识别颜色。手机端附件功能端到端全部完成。**
+
+测试附件已删除、测试线程保留（无副作用）、临时配对身份已撤销。
