@@ -601,3 +601,56 @@ expected internally tagged enum SandboxPolicyDeserialize"}
 - 附件命令（`attachment.upload.begin/chunk/end`、`attachment.add`、
   `content.read`、`input.capabilities.read`）在本机目录里都不存在。
   手机端已据此隐藏图片/文件入口，等 Bridge 实现后会自动出现。
+
+## 11. 复测结果（Bridge 2.1.13）
+
+再次用临时配对身份直连本机 Bridge 复测。
+
+### 已修复
+
+- `initialize` 已声明 `capabilities.experimentalApi=true`，
+  `experimentalApi` 报错消失。
+- `sandbox_policy` 已做对象映射（`_sandbox_policy_object`）。
+
+### 手机新建会话（Bridge 自己持有）：通过
+
+```text
+thread.start            -> 200, 新线程 01a157d8-...
+thread.settings.read    -> 200
+thread.settings.update  -> 200 {"applied": true}
+  params: approval_policy=never, sandbox_policy=danger-full-access
+thread.settings.update  -> 200 {"applied": true}   # 切回 on-request / workspace-write
+```
+
+说明手机端“请求批准 / 完全允许”的写入链路已经可用。
+
+### 仍存在的 Bridge 缺口
+
+1. **桌面持有的线程仍然无法改设置**
+
+```text
+thread.settings.update -> 503
+"App Server 调用失败 thread/settings/update：thread not found: <id>"
+```
+
+`CompanionService.update_thread_settings` 只查 `_desktop_followed`，没有像
+`start_turn` 那样调用 `_desktop_owner()` 做 owner discovery，所以桌面线程
+找不到 owner 就落到 Bridge 自己的 app-server，而那个 app-server 不认识这条
+线程。需要按 `start_turn` 的方式先发现 owner 再走
+`thread-follower-update-thread-settings`。
+
+2. **`thread.settings.read` 读不回策略值**
+
+`thread/read` 返回的 thread 对象里没有 `approvalPolicy` /
+`sandboxPolicy` / `approvalsReviewer`（实测 keys 里完全没有这三个字段），
+所以 `read_thread_settings` 永远返回空字符串。
+
+影响：手机端无法在重进会话时恢复上次选择的模式，只能保持本地默认值。
+建议 Bridge 从 app-server 的 `thread/resume` 或线程设置接口取实际值，
+或在 update 成功后缓存并在 read 时返回。
+
+3. **附件命令仍然不存在**
+
+`attachment.upload.begin/chunk/end`、`attachment.add`、
+`input.capabilities.read`、`content.read` 在命令目录里都不存在，
+手机端继续隐藏图片/文件入口。

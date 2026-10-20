@@ -1713,6 +1713,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runCatching { client.threadSettings(threadId) }
                 .onSuccess { settings ->
+                    // Some bridge versions do not report approval policy in
+                    // thread/read (the fields come back empty). Only trust a
+                    // non-empty answer; never reset the user's last choice to
+                    // the default because the read was incomplete.
                     val resolved = when {
                         settings.approvalPolicy == "never" ||
                             settings.sandboxPolicy == "danger-full-access" ->
