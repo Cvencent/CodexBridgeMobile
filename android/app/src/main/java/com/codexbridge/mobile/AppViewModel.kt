@@ -1881,14 +1881,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleError(error: Throwable) {
-        // A 401 can be a transient bridge restart or a stale token. Keep the
-        // saved address/token/installation identity so the next launch can
-        // reconnect; only the explicit settings action clears pairing.
-        val disconnected = error is ApiException && error.unauthorized
+        val unauthorized = error is ApiException && error.unauthorized
+        if (unauthorized && _state.value.screen != AppScreen.Pair) {
+            // The pairing token is genuinely dead (bridge store reset, phone
+            // record deleted, or rotated past the grace window). Navigation to
+            // the Pair screen is the only useful response — retrying with the
+            // same token will keep failing. Saved addresses are pre-filled so
+            // the user just needs a new pairing code.
+            streamJob?.cancel()
+            pollJob?.cancel()
+            threadsJob?.cancel()
+            screenStreamJob?.cancel()
+            threadsJob = null
+            screenStreamJob = null
+            _state.update {
+                it.copy(
+                    error = friendly(error),
+                    connected = false,
+                    screen = AppScreen.Pair,
+                    activeThread = null,
+                    messages = emptyList(),
+                    streaming = emptyMap(),
+                    approvals = emptyList(),
+                    busy = false,
+                    sending = false,
+                )
+            }
+            return
+        }
         _state.update {
             it.copy(
                 error = friendly(error),
-                connected = if (disconnected) false else it.connected,
+                connected = if (unauthorized) false else it.connected,
             )
         }
     }
