@@ -152,3 +152,23 @@ app-server。
 
 卡死的 working 状态会在 rollout 活动停止约 150 秒后自动清为 idle
 （`LOG_ACTIVE_SECONDS`），或者用户在手机上点中断也可以。
+
+---
+
+## 附加：队列卡住问题
+
+手机消息有时卡在"待发送队列"里不发。不是必现的——取决于该会话在桌面上
+是否同时活跃。
+
+### 根因
+
+和上面的可见性问题**同一个根因**。队列派发调用 `start_turn` →
+`_desktop_owner()` 返回 `None` → `_writable_thread` 和桌面争 writer
+lock → turn 死了 → Bridge 的 `_active_turn_id(thread_id)` 残留（turn 没有正常
+完成所以没被清理）→ 队列的 `_is_active()` 看到线程"活跃"就永远不派发。
+
+`on_turn_finished(thread_id)` 也不会被调用（turn 没有正常完成），
+所以 `_paused` 和 stale active turn 状态永远不会被清除。
+
+上面的 `_desktop_owner()` 修复（方案 A，`isolated` 参数）同时解决这个
+问题：手机 turn 走桌面 Codex，只有单一 writer，不存在竞争。
