@@ -861,6 +861,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     _state.update { state ->
                         state.copy(
+                            messages = detail.messages,
+                            messageCount = detail.message_count,
                             task = detail.task.copy(status = status),
                             working = status in ACTIVE_TASK_STATUSES,
                         )
