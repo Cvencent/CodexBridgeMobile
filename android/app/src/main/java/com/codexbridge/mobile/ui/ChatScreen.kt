@@ -24,6 +24,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -697,11 +698,13 @@ private fun UserBubble(text: String) {
                 )
                 .padding(horizontal = 12.dp, vertical = 9.dp),
         ) {
-            Text(
-                text = text,
-                fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-            )
+            SelectionContainer {
+                Text(
+                    text = text,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
         }
     }
 }
@@ -735,7 +738,9 @@ private fun AgentBubble(item: MessageItem, streaming: String) {
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(text = body, fontSize = 14.sp)
+                SelectionContainer {
+                    Text(text = body, fontSize = 14.sp)
+                }
             }
         }
     }
@@ -755,12 +760,14 @@ private fun QuietBlock(text: String, label: String?, italic: Boolean) {
                 )
                 Spacer(modifier = Modifier.height(2.dp))
             }
-            Text(
-                text = text,
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
-            )
+            SelectionContainer {
+                Text(
+                    text = text,
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
+                )
+            }
         }
     }
 }
@@ -871,7 +878,9 @@ private fun ToolBlock(item: MessageItem) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             if (body.isNotBlank()) {
-                Text(text = body, fontSize = 13.sp)
+                SelectionContainer {
+                    Text(text = body, fontSize = 13.sp)
+                }
             }
             if (result.isNotBlank()) {
                 MonoBlock(result.take(6000))
@@ -917,11 +926,13 @@ private fun PlanBlock(item: MessageItem) {
                 }
                 Row(verticalAlignment = Alignment.Top) {
                     Text(text = marker, fontSize = 13.sp, color = color, modifier = Modifier.width(18.dp))
-                    Text(
-                        text = step.step,
-                        fontSize = 13.sp,
-                        color = if (done) MaterialTheme.colorScheme.onSurfaceVariant else color,
-                    )
+                    SelectionContainer {
+                        Text(
+                            text = step.step,
+                            fontSize = 13.sp,
+                            color = if (done) MaterialTheme.colorScheme.onSurfaceVariant else color,
+                        )
+                    }
                 }
             }
         }
@@ -935,12 +946,14 @@ private fun NoticeLine(text: String) {
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.Center,
     ) {
-        Text(
-            text = text,
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
+        SelectionContainer {
+            Text(
+                text = text,
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }
 
