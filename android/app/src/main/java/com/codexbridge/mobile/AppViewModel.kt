@@ -500,12 +500,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun refreshThreads(): Boolean = refreshLock.withLock {
         val client = api ?: return@withLock false
         _state.update { it.copy(refreshing = true) }
-        runCatching {
+
+        suspend fun fetchAndUpdate(): Boolean = runCatching {
             withTimeout(REFRESH_TIMEOUT_MS) { client.threads(_state.value.search) }
         }
             .fold(
                 onSuccess = { response ->
-                val visible = mergePendingThreads(response.threads, clearConfirmed = true)
+                    val visible = mergePendingThreads(response.threads, clearConfirmed = true)
                     val normalized = visible.map(::normalizeUnconfirmedFailure).map { thread ->
                         val readOverride = settings.threadReadOverrideAt(thread.thread_id)
                         if (
@@ -518,15 +519,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             thread
                         }
                     }
-                _state.update { state ->
-                    state.copy(
-                        threads = normalized,
-                        connected = true,
-                        refreshing = false,
-                        manualRefreshing = false,
-                        lastRefreshedAt = System.currentTimeMillis(),
-                    )
-                }
+                    _state.update { state ->
+                        state.copy(
+                            threads = normalized,
+                            connected = true,
+                            refreshing = false,
+                            manualRefreshing = false,
+                            lastRefreshedAt = System.currentTimeMillis(),
+                        )
+                    }
                     true
                 },
                 onFailure = {
@@ -534,6 +535,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     false
                 },
             )
+
+        val ok = fetchAndUpdate()
+
+        // The Bridge's app-server can return thread stubs with blank titles
+        // right after a restart while it hydrates metadata from rollout logs.
+        // Retry once so the user doesn't see a list of unnamed tasks.
+        val threads = _state.value.threads
+        if (ok && threads.isNotEmpty() && threads.all { it.title.isBlank() }) {
+            delay(3000)
+            fetchAndUpdate()
+        }
+
+        ok
     }
 
     private fun loadModels() {
