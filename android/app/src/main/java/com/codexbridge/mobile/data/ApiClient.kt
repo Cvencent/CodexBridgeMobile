@@ -165,7 +165,7 @@ class ApiClient(
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.1.2",
+                firmware = "1.1.3",
             )
             cbdp = created
             return created
@@ -466,18 +466,16 @@ class ApiClient(
         model: String = "",
         effort: String = "",
         inputParts: List<Map<String, Any>> = emptyList(),
+        mode: String = "start",
     ): SendResponse = withTransport(
         cbdpCall = {
-            if (inputParts.isEmpty()) {
-                cbdpSendMessage(threadId, text, model, effort)
+            if (mode == "steer" || inputParts.isNotEmpty()) {
+                postCompanionMessage(threadId, text, model, effort, inputParts, mode)
             } else {
-                // Attachments travel through the Companion REST route: it is
-                // the path the Bridge documents for input_parts and it applies
-                // the same attachment validation regardless of CBDP support.
-                postCompanionMessage(threadId, text, model, effort, inputParts)
+                cbdpSendMessage(threadId, text, model, effort)
             }
         },
-        companionCall = { postCompanionMessage(threadId, text, model, effort, inputParts) },
+        companionCall = { postCompanionMessage(threadId, text, model, effort, inputParts, mode) },
     )
 
     private suspend fun postCompanionMessage(
@@ -486,6 +484,7 @@ class ApiClient(
         model: String,
         effort: String,
         inputParts: List<Map<String, Any>>,
+        mode: String = "start",
     ): SendResponse = json.decodeFromString(
         SendResponse.serializer(),
         postText(
@@ -494,7 +493,7 @@ class ApiClient(
                 if (text.isNotBlank()) put("text", text)
                 if (model.isNotBlank()) put("model", model)
                 if (effort.isNotBlank()) put("effort", effort)
-                put("mode", "start")
+                put("mode", mode)
                 if (inputParts.isNotEmpty()) {
                     put("input_parts", buildJsonArray {
                         inputParts.forEach { part ->

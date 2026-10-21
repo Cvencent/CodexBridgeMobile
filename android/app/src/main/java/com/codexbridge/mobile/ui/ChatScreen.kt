@@ -386,7 +386,10 @@ fun ChatScreen(
                     onValueChange = { input = it },
                     enabled = state.canWrite,
                     placeholder = {
-                        Text("发送后加入队列", maxLines = 1)
+                        Text(
+                            if (state.working) "引导正在运行的对话…" else "发送消息",
+                            maxLines = 1,
+                        )
                     },
                     maxLines = 5,
                     shape = RoundedCornerShape(16.dp),

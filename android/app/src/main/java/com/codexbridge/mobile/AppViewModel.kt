@@ -851,6 +851,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     model = _state.value.selectedModel,
                     effort = _state.value.selectedEffort,
                     inputParts = parts,
+                    mode = if (_state.value.working) "steer" else "start",
                 )
                 _state.update { it.copy(pendingAttachments = emptyList()) }
                 refreshQueue(threadId)
