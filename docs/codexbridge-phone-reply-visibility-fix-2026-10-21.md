@@ -172,3 +172,93 @@ lock → turn 死了 → Bridge 的 `_active_turn_id(thread_id)` 残留（turn �
 
 上面的 `_desktop_owner()` 修复（方案 A，`isolated` 参数）同时解决这个
 问题：手机 turn 走桌面 Codex，只有单一 writer，不存在竞争。
+
+---
+
+## 2.1.25 复测结果
+
+你从 master 5183afe 重建的 2.1.25 已部署并验证。
+
+### 已修复 ✅
+
+- `_desktop_owner()` 的 `isolated` 参数修复**已生效**。验证：`update_thread_settings` 现在能路由到桌面（错误从 `codex_unavailable` 变成了 `desktop_unavailable`，说明成功找到了桌面 owner）。
+- 手机回复正常完成（发到 idle 线程，turn 正常跑完）。
+- 手机回复不再卡队列。
+
+### 仍需修复 ❌：sandbox_policy 在桌面 IPC 路径上格式错误
+
+`_sandbox_policy_object()` 确实存在（我之前搜索 .exe 的方法有误，PyInstaller 压缩了字节码），但你为桌面 IPC 写的转换函数 `_sandbox_policy_wire_name()` 返回了**错误的格式**。
+
+`codexbridge/codex/desktop_ipc.py` 第 21–28 行：
+
+```python
+_SANDBOX_POLICY_NAMES = {
+    "danger-full-access": "danger-full-access",   # ← 返回字符串
+    ...
+}
+
+def _sandbox_policy_wire_name(value: Any) -> str:
+    """Desktop IPC expects the dotted string name for sandbox policies."""
+    ...
+    return _SANDBOX_POLICY_NAMES[name]             # ← 返回 "danger-full-access" 字符串
+```
+
+然后 `update_thread_settings` 里：
+
+```python
+settings['sandboxPolicy'] = _sandbox_policy_wire_name(sandbox_policy)  # ← 发的是字符串
+```
+
+但桌面 Codex 的 `SandboxPolicyDeserialize` 期望的是**内部标记枚举对象**：
+
+```json
+{"type": "dangerFullAccess"}
+```
+
+不是字符串 `"danger-full-access"`。
+
+### 修复
+
+把 `_sandbox_policy_wire_name()` 改为返回对象：
+
+```python
+_SANDBOX_POLICY_NAMES = {
+    "read-only": "readOnly",
+    "readOnly": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "workspaceWrite": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+    "dangerFullAccess": "dangerFullAccess",
+}
+
+def _sandbox_policy_wire_name(value: Any) -> dict:
+    """Desktop IPC expects the internally tagged enum object."""
+
+    if isinstance(value, dict):
+        if str(value.get("type") or ""):
+            return dict(value)
+        raise DesktopIpcError("sandbox_policy")
+    name = _SANDBOX_POLICY_NAMES.get(str(value or ""))
+    if name is None:
+        raise DesktopIpcError(f"Unsupported sandbox policy: {name}")
+    return {"type": name}
+```
+
+### 2.1.25 验证明细
+
+```text
+✅ 配对正常
+✅ threads.list 正常
+❌ thread.settings.update (sandbox_policy="danger-full-access") → 503 desktop_unavailable
+     错误: Invalid request: invalid type: string "danger-full-access",
+           expected internally tagged enum SandboxPolicyDeserialize
+✅ 手机回复发到 idle 线程 → 200，turn 正常完成
+✅ 回复不再卡队列
+```
+
+### 之前文档中的更正
+
+我之前说 ".exe 里搜不到 _sandbox_policy_object 字符串" —— 这个判断方法有误。
+PyInstaller 会把 Python 模块压缩进 PYZ.pyz，原始字节搜索找不到是正常的。
+你的解包检查确认了函数确实存在。问题不在于函数缺失，而在于
+`_sandbox_policy_wire_name()` 的返回值格式不对。
