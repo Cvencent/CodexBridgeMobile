@@ -84,6 +84,44 @@ fun coherentTaskStatus(current: String, incoming: String): String {
     }
 }
 
+/**
+ * Merge a server message list with optimistic local messages.
+ *
+ * The phone declares the `queue` capability, so a reply is enqueued and the
+ * turn starts asynchronously: an immediate `thread/read` still reports the old
+ * message list. Replacing the local view with that stale snapshot used to make
+ * the message the user just sent disappear until the next refresh, so any local
+ * message the server has not confirmed yet is kept at the end.
+ */
+fun mergeServerMessages(
+    local: List<MessageItem>,
+    server: List<MessageItem>,
+    nowSeconds: Long = System.currentTimeMillis() / 1000,
+): List<MessageItem> {
+    val optimistic = local
+        .filter { it.id.startsWith(LOCAL_MESSAGE_PREFIX) }
+        // A row the server never confirms (rejected enqueue, lost rollout)
+        // must not stick to the conversation forever.
+        .filter { it.created_at <= 0 || nowSeconds - it.created_at <= LOCAL_MESSAGE_TTL_SECONDS }
+    if (optimistic.isEmpty()) return server
+    val confirmed = optimistic.filterNot { pending ->
+        server.any { it.kind == pending.kind && it.text.trim() == pending.text.trim() }
+    }
+    return server + confirmed
+}
+
+const val LOCAL_MESSAGE_PREFIX = "local-"
+
+/** How long an optimistic reply may outlive the server snapshot that lacked it. */
+const val LOCAL_MESSAGE_TTL_SECONDS = 5 * 60L
+
+/**
+ * True when this row should be treated as a locally-staged reply rather than a
+ * server-confirmed message.
+ */
+fun isLocalMessage(message: MessageItem): Boolean =
+    message.id.startsWith(LOCAL_MESSAGE_PREFIX)
+
 /** Map a `thread/status/changed` payload onto the task status vocabulary. */
 fun threadStatusToTaskStatus(status: String, activeFlags: List<String>, current: String): String =
     when {

@@ -41,6 +41,9 @@ import com.codexbridge.mobile.data.normalizeUnconfirmedFailure
 import com.codexbridge.mobile.data.confirmedPendingCompletionIds
 import com.codexbridge.mobile.data.mergePendingCompletions
 import com.codexbridge.mobile.data.sortThreadsByActivity
+import com.codexbridge.mobile.data.mergeServerMessages
+import com.codexbridge.mobile.data.LOCAL_MESSAGE_PREFIX
+import com.codexbridge.mobile.data.isLocalMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -667,15 +670,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 val status = reconciled.thread.status
                 _state.update { state ->
+                    val merged = mergeServerMessages(state.messages, detail.messages)
                     state.copy(
                         activeThread = reconciled.thread,
                         threads = state.threads.map { thread ->
                             if (thread.thread_id == threadId) reconciled.thread else thread
                         },
-                        messages = detail.messages,
+                        messages = merged,
                         task = reconciled.task,
                         approvals = detail.pending_approvals,
-                        working = status in ACTIVE_TASK_STATUSES,
+                        working = status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                         messageCount = detail.message_count,
                         truncated = detail.truncated,
                         queue = applyQueueSnapshot(
@@ -809,15 +813,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             _state.value.activeThread?.status.orEmpty(),
                         )
                         _state.update { state ->
+                            val merged = mergeServerMessages(state.messages, detail.messages)
                             state.copy(
                                 activeThread = if (state.activeThread?.thread_id == threadId) reconciled.thread else state.activeThread,
                                 threads = state.threads.map { thread ->
                                     if (thread.thread_id == threadId) reconciled.thread else thread
                                 },
-                                messages = detail.messages,
+                                messages = merged,
                                 task = reconciled.task,
                                 approvals = detail.pending_approvals,
-                                working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
+                                working = reconciled.thread.status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                                 messageCount = detail.message_count,
                                 queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
                             )
@@ -838,7 +843,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         settings.clearPendingCompletion(threadId)
-        _state.update { it.copy(error = null, sending = true) }
+        // A reply is enqueued (the phone declares `queue`), so the turn starts
+        // asynchronously and an immediate thread/read still has the old list.
+        // Show the message and the running state locally right away; the
+        // server copy replaces the local row once it lands.
+        //
+        // Read the running flag before the optimistic update below: flipping
+        // `working` first would make an idle thread send `steer` instead of
+        // `start`, which the Bridge rejects.
+        val wasWorking = _state.value.working
+        val localMessageId = LOCAL_MESSAGE_PREFIX + UUID.randomUUID()
+        _state.update { state ->
+            state.copy(
+                error = null,
+                sending = true,
+                working = true,
+                messages = state.messages + MessageItem(
+                    id = localMessageId,
+                    kind = "user",
+                    text = content,
+                    created_at = System.currentTimeMillis() / 1000,
+                ),
+                task = state.task.copy(status = "working"),
+                threads = sortThreadsByActivity(
+                    state.threads.map { thread ->
+                        if (thread.thread_id == threadId) {
+                            thread.copy(status = "working", updated_at = System.currentTimeMillis() / 1000)
+                        } else {
+                            thread
+                        }
+                    },
+                ),
+            )
+        }
         viewModelScope.launch {
             try {
                 val uploaded = mutableListOf<com.codexbridge.mobile.data.UploadedAttachment>()
@@ -875,27 +912,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     model = _state.value.selectedModel,
                     effort = _state.value.selectedEffort,
                     inputParts = parts,
-                    mode = if (_state.value.working) "steer" else "start",
+                    mode = if (wasWorking) "steer" else "start",
                 )
                 _state.update { it.copy(pendingAttachments = emptyList()) }
                 refreshQueue(threadId)
                 runCatching { client.thread(threadId) }.onSuccess { detail ->
-                    val status = coherentTaskStatus(
-                        _state.value.activeThread?.status.orEmpty(),
-                        detail.task.status,
-                    )
                     _state.update { state ->
+                        val merged = mergeServerMessages(state.messages, detail.messages)
+                        // The enqueued reply is not in the server list yet, so
+                        // the thread still reports idle. Reporting that now is
+                        // exactly the "shows 空闲 and my message is gone" bug.
+                        val awaitingServer = merged.any(::isLocalMessage)
+                        val status = if (awaitingServer) {
+                            "working"
+                        } else {
+                            coherentTaskStatus(
+                                state.activeThread?.status.orEmpty(),
+                                detail.task.status,
+                            )
+                        }
                         state.copy(
-                            messages = detail.messages,
-                            messageCount = detail.message_count,
+                            messages = merged,
+                            messageCount = maxOf(detail.message_count, merged.size),
                             task = detail.task.copy(status = status),
-                            working = status in ACTIVE_TASK_STATUSES,
+                            working = status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                         )
                     }
                 }
             } catch (error: Exception) {
                 _state.update { state ->
                     state.copy(
+                        messages = state.messages.filterNot { it.id == localMessageId },
+                        // Only retire the optimistic running state we raised;
+                        // a thread that was already working stays working.
+                        working = wasWorking || state.messages.any {
+                            it.id != localMessageId && isLocalMessage(it)
+                        },
+                        task = state.task.copy(status = if (wasWorking) state.task.status else "idle"),
+                        threads = sortThreadsByActivity(
+                            state.threads.map { thread ->
+                                if (thread.thread_id == threadId) {
+                                    thread.copy(status = if (wasWorking) thread.status else "idle")
+                                } else {
+                                    thread
+                                }
+                            },
+                        ),
                         restoreInput = if (content.isNotEmpty()) content else state.restoreInput,
                         sending = false,
                         pendingAttachments = state.pendingAttachments.map { item ->
@@ -991,7 +1053,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             runCatching { client.queue(threadId) }
                 .onSuccess { response ->
                     _state.update { state ->
+                        // Only the queue changed here. Never rewrite the
+                        // message list from this response: an empty server list
+                        // would drop the whole conversation. Just keep the
+                        // running state while a reply is still unconfirmed.
                         state.copy(
+                            working = state.working || state.messages.any(::isLocalMessage),
                             queue = applyQueueSnapshot(
                                 state.queue,
                                 threadId,
@@ -1432,7 +1499,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _state.update { state ->
                     val base = if (resolved.kind == "user") {
-                        state.messages.filterNot { it.id.startsWith("local-") && it.text == resolved.text }
+                        state.messages.filterNot { isLocalMessage(it) && it.text == resolved.text }
                     } else {
                         state.messages
                     }
@@ -1469,7 +1536,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _state.update { state ->
                     state.copy(
                         working = if (state.activeThread?.thread_id == threadId) {
-                            visibleStatus in ACTIVE_TASK_STATUSES
+                            // A completion can belong to the previous turn while
+                            // the reply just sent is still queued, so an
+                            // unconfirmed local row keeps the chat running.
+                            visibleStatus in ACTIVE_TASK_STATUSES ||
+                                state.messages.any(::isLocalMessage)
                         } else {
                             state.working
                         },
@@ -1499,6 +1570,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (!threadId.isNullOrBlank()) {
                     api?.let { client ->
                         viewModelScope.launch {
+                            // The completion may land before the rollout file
+                            // holds the reply that produced it. Re-read shortly
+                            // after so the confirmed message replaces the local
+                            // placeholder instead of waiting for the 30s poll.
+                            if (_state.value.messages.any(::isLocalMessage)) {
+                                delay(1500)
+                            }
                             runCatching { client.thread(threadId) }.onSuccess { detail ->
                                 val status = coherentTaskStatus(
                                     _state.value.activeThread?.status.orEmpty(),
@@ -1507,15 +1585,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 val visibleThread = detail.thread.copy(status = status)
                                 val visibleTask = detail.task.copy(status = status)
                                 _state.update { state ->
+                                    val merged = mergeServerMessages(state.messages, detail.messages)
                                     state.copy(
                                         activeThread = if (state.activeThread?.thread_id == threadId) visibleThread else state.activeThread,
                                         threads = state.threads.map { thread ->
                                             if (thread.thread_id == threadId) visibleThread else thread
                                         },
-                                        messages = detail.messages,
+                                        messages = merged,
                                         task = visibleTask,
                                         approvals = detail.pending_approvals,
-                                        working = status in ACTIVE_TASK_STATUSES,
+                                        working = status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                                         messageCount = detail.message_count,
                                     )
                                 }
@@ -1571,7 +1650,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             },
                         ),
                         task = if (activeMatches) state.task.copy(status = status) else state.task,
-                        working = if (activeMatches) status in ACTIVE_TASK_STATUSES else state.working,
+        working = if (activeMatches) {
+                    status in ACTIVE_TASK_STATUSES || state.messages.any(::isLocalMessage)
+                } else {
+                    state.working
+                },
                     )
                 }
             }
@@ -1669,16 +1752,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 _state.value.activeThread?.status.orEmpty(),
                             )
                             _state.update { state ->
+                                val merged = mergeServerMessages(state.messages, detail.messages)
                                 state.copy(
                                     activeThread = if (state.activeThread?.thread_id == threadId) {
                                         reconciled.thread
                                     } else {
                                         state.activeThread
                                     },
-                                    messages = detail.messages,
+                                    messages = merged,
                                     task = reconciled.task,
                                     approvals = detail.pending_approvals,
-                                    working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
+                                    working = reconciled.thread.status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                                     messageCount = detail.message_count,
                                     queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
                                 )
@@ -1830,15 +1914,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
         val status = reconciled.thread.status
         _state.update { state ->
+            val merged = mergeServerMessages(state.messages, detail.messages)
             state.copy(
                 activeThread = if (state.activeThread?.thread_id == threadId) reconciled.thread else state.activeThread,
                 threads = state.threads.map { thread ->
                     if (thread.thread_id == threadId) reconciled.thread else thread
                 },
-                messages = detail.messages,
+                messages = merged,
                 task = reconciled.task,
                 approvals = detail.pending_approvals,
-                working = status in ACTIVE_TASK_STATUSES,
+                working = status in ACTIVE_TASK_STATUSES || merged.any(::isLocalMessage),
                 messageCount = detail.message_count,
                 queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
             )
@@ -1873,7 +1958,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (thread.thread_id == threadId) thread.copy(status = status) else thread
                 },
                 task = if (state.task.thread_id == threadId) state.task.copy(status = status) else state.task,
-                working = if (activeMatches) status in ACTIVE_TASK_STATUSES else state.working,
+working = if (activeMatches) {
+                    status in ACTIVE_TASK_STATUSES || state.messages.any(::isLocalMessage)
+                } else {
+                    state.working
+                },
             )
         }
     }

@@ -181,3 +181,45 @@ class ThreadStateTest {
         assertEquals(setOf("confirmed"), confirmedPendingCompletionIds(threads, pending))
     }
 }
+
+class MergeServerMessagesTest {
+    private fun local(text: String, createdAt: Long = System.currentTimeMillis() / 1000) =
+        MessageItem(id = LOCAL_MESSAGE_PREFIX + "abc", kind = "user", text = text, created_at = createdAt)
+
+    private fun server(text: String) =
+        MessageItem(id = "srv-1", kind = "user", text = text)
+
+    @Test
+    fun unconfirmedLocalReplyStaysVisibleAfterAStaleServerRead() {
+        val merged = mergeServerMessages(listOf(local("你好")), emptyList())
+        assertEquals(1, merged.size)
+        assertEquals("你好", merged.first().text)
+        assertTrue(isLocalMessage(merged.first()))
+    }
+
+    @Test
+    fun localReplyIsDroppedOnceTheServerListHasIt() {
+        val merged = mergeServerMessages(listOf(local("你好")), listOf(server("你好")))
+        assertEquals(1, merged.size)
+        assertEquals("srv-1", merged.first().id)
+        assertFalse(merged.any(::isLocalMessage))
+    }
+
+    @Test
+    fun serverListIsUsedVerbatimWhenThereIsNothingLocal() {
+        val merged = mergeServerMessages(listOf(server("旧消息")), listOf(server("旧消息"), server("新消息")))
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun unconfirmedLocalReplyIsNotKeptForever() {
+        val stale = local("很久以前", createdAt = System.currentTimeMillis() / 1000 - 10 * 60)
+        assertTrue(mergeServerMessages(listOf(stale), emptyList()).isEmpty())
+    }
+
+    @Test
+    fun whitespaceDifferencesStillCountAsConfirmed() {
+        val merged = mergeServerMessages(listOf(local("  你好  ")), listOf(server("你好")))
+        assertFalse(merged.any(::isLocalMessage))
+    }
+}
