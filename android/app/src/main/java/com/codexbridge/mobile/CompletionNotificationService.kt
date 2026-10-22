@@ -79,7 +79,7 @@ class CompletionNotificationService : Service() {
         job?.cancel()
         scope.cancel()
         releaseConnectionLocks()
-        cachedClient = null
+        resetCachedClient()
         super.onDestroy()
     }
 
@@ -159,6 +159,18 @@ class CompletionNotificationService : Service() {
         } else {
             startForeground(LISTEN_NOTIFICATION_ID, notification)
         }
+    }
+
+    /**
+     * Drop the cached client, closing its long-lived CBDP stream first.
+     *
+     * Assigning null alone leaked a live event stream every time the listener
+     * hit an error and rebuilt the client.
+     */
+    private fun resetCachedClient() {
+        val previous = cachedClient
+        cachedClient = null
+        previous?.close()
     }
 
     private suspend fun clientFor(settings: SettingsStore): ApiClient {
@@ -262,11 +274,11 @@ class CompletionNotificationService : Service() {
                         }
                     }
                 }
-                if (streamFailed) cachedClient = null
+                if (streamFailed) resetCachedClient()
                 attempt += 1
                 delay(backoffMillis(attempt))
             } catch (_: Exception) {
-                cachedClient = null
+                resetCachedClient()
                 attempt += 1
                 delay(backoffMillis(attempt))
             }
@@ -308,7 +320,7 @@ class CompletionNotificationService : Service() {
                     }
                 }
             } catch (_: Exception) {
-                cachedClient = null
+                resetCachedClient()
                 attempt += 1
                 delay(backoffMillis(attempt))
             }

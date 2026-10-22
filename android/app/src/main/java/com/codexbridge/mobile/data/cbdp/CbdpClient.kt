@@ -30,6 +30,7 @@ import java.io.Closeable
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.random.Random
 
 class CbdpClientException(
     message: String,
@@ -108,6 +109,16 @@ class CbdpClient(
     @Volatile private var closed = false
     private var heartbeatJob: Job? = null
 
+    // One reconnect at a time. Every listener callback used to schedule its own
+    // reconnect, so a single outage could start several overlapping connects and
+    // leak one event stream per attempt.
+    private val reconnectGuard = Any()
+    private var reconnectJob: Job? = null
+    private var reconnectAttempt = 0
+
+    // Honor the server's Retry-After before opening a new stream again.
+    @Volatile private var retryAfterAtMs: Long = 0
+
     val maxChunkBytes: Int get() = session.maxChunkBytes()
     val deviceRef: Long get() = session.deviceRef
 
@@ -145,6 +156,10 @@ class CbdpClient(
     suspend fun connect() = connectLock.withLock {
         if (session.state == CbdpSessionState.READY && (!sseMode || sseSource != null)) return@withLock
         closed = false
+        // A previous attempt may have left a live stream behind (the handshake
+        // can time out after the socket is already up). Cancel it first: a new
+        // connection must never be opened on top of an unreleased one.
+        releaseStreams()
         resetConnectionState()
         val wsUrl = toWebSocketUrl(baseUrl) + "/cbdp/v1/ws"
         val request = Request.Builder()
@@ -199,6 +214,7 @@ class CbdpClient(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (socket === webSocket) socket = null
+            noteRetryAfter(response)
             if (!closed) scheduleReconnect()
         }
     }
@@ -229,6 +245,7 @@ class CbdpClient(
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
                 if (sseSource === eventSource) sseSource = null
+                noteRetryAfter(response)
                 if (!closed) scheduleReconnect()
             }
 
@@ -238,9 +255,20 @@ class CbdpClient(
             }
         }
         sseMode = true
+        // Never stack a second event stream on top of a live one.
+        runCatching { sseSource?.cancel() }
+        sseSource = null
         val source = EventSources.createFactory(client).newEventSource(request, listener)
         sseSource = source
-        withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitReady() }
+        try {
+            withTimeout(HANDSHAKE_TIMEOUT_MS) { awaitReady() }
+        } catch (error: Exception) {
+            if (sseSource === source) {
+                runCatching { source.cancel() }
+                sseSource = null
+            }
+            throw error
+        }
     }
 
     private fun receive(bytes: ByteArray) {
@@ -742,12 +770,65 @@ class CbdpClient(
         heartbeatJob?.cancel()
     }
 
+    /**
+     * Schedule exactly one reconnect.
+     *
+     * WebSocket and SSE listeners both call this on close and on failure, and a
+     * handshake timeout triggers another path, so without the guard a single
+     * outage queued several overlapping connects. Delay grows exponentially with
+     * +/-20% jitter and never exceeds [MAX_RECONNECT_DELAY_MS], and a server
+     * `Retry-After` always wins.
+     */
     private fun scheduleReconnect() {
         if (closed) return
-        scope.launch {
-            delay(RECONNECT_DELAY_MS)
-            runCatching { connect() }
+        synchronized(reconnectGuard) {
+            if (reconnectJob?.isActive == true) return
+            reconnectJob = scope.launch {
+                val retryAfterDelay = (retryAfterAtMs - System.currentTimeMillis()).coerceAtLeast(0L)
+                val backoff = backoffDelayMs(reconnectAttempt)
+                if (retryAfterDelay > 0) {
+                    delay(retryAfterDelay)
+                } else {
+                    delay(backoff)
+                }
+                runCatching { connect() }
+                // A successful dial resets the curve; a failed one keeps it
+                // climbing so repeated outages stay cheap.
+                if (session.state == CbdpSessionState.READY) {
+                    reconnectAttempt = 0
+                } else {
+                    reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(16)
+                }
+            }
         }
+    }
+
+    private fun backoffDelayMs(attempt: Int): Long {
+        val base = (BASE_RECONNECT_DELAY_MS shl attempt.coerceIn(0, 5))
+            .coerceAtMost(MAX_RECONNECT_DELAY_MS)
+        val jitter = (base * 0.2).toLong().coerceAtLeast(1L)
+        return base + Random.nextLong(-jitter, jitter + 1)
+    }
+
+    /** Remember a server-mandated pause (HTTP 429 + Retry-After). */
+    private fun noteRetryAfter(response: Response?) {
+        if (response == null || response.code != 429) return
+        val seconds = response.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L
+        val waitMs = if (seconds > 0) seconds * 1000L else DEFAULT_RETRY_AFTER_MS
+        retryAfterAtMs = System.currentTimeMillis() + waitMs.coerceAtMost(MAX_RETRY_AFTER_MS)
+    }
+
+    /**
+     * Cancel every long-lived transport this client owns.
+     *
+     * The reconnect path calls this before dialing again so a timed-out
+     * handshake can never leave its EventSource or WebSocket registered.
+     */
+    private fun releaseStreams() {
+        runCatching { socket?.cancel() }
+        socket = null
+        runCatching { sseSource?.cancel() }
+        sseSource = null
     }
 
     private fun failConnection(error: Throwable) {
@@ -764,6 +845,8 @@ class CbdpClient(
 
     override fun close() {
         closed = true
+        reconnectJob?.cancel()
+        reconnectJob = null
         heartbeatJob?.cancel()
         socket?.close(1000, "bye")
         socket = null
@@ -789,7 +872,10 @@ class CbdpClient(
 
     companion object {
         private const val HANDSHAKE_TIMEOUT_MS = 12_000L
-        private const val RECONNECT_DELAY_MS = 1_200L
+        private const val BASE_RECONNECT_DELAY_MS = 1_000L
+        private const val MAX_RECONNECT_DELAY_MS = 30_000L
+        private const val DEFAULT_RETRY_AFTER_MS = 20_000L
+        private const val MAX_RETRY_AFTER_MS = 5 * 60_000L
         private const val RETRANSMIT_TIMEOUT_MS = 1_000L
         private const val MAX_RETRANSMIT_MS = 8_000L
         private const val MAX_RETRIES = 6

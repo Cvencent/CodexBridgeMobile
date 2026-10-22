@@ -236,6 +236,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         if (paired) {
+            api?.close()
             api = ApiClient(base, settings.token, settings.phoneId)
             CompletionNotificationService.start(appContext)
             startThreadsRefresh()
@@ -263,6 +264,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings.baseUrl = selected.url
                 val role = selected.endpoint.role.name.lowercase()
                 if (previous != selected.url || api == null || _state.value.activeRouteRole != role) {
+                    // Close the outgoing client so its CBDP stream cannot leak.
+                    api?.close()
                     api = ApiClient(selected.url, settings.token, settings.phoneId)
                     _state.update { state ->
                         state.copy(
@@ -349,6 +352,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings.bridgeName = response.bridge.name.ifBlank { ping.name }
                 settings.bridgeVersion = response.bridge.version.ifBlank { ping.version }
                 settings.phoneId = response.phone_id
+                api?.close()
                 api = ApiClient(resolved.base, response.token, response.phone_id)
                 _state.update {
                     it.copy(
@@ -387,6 +391,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         threadsJob = null
         settings.clearPairing()
         closeThread()
+        api?.close()
         api = null
         _state.update {
             it.copy(

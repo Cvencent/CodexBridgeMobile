@@ -21,6 +21,7 @@ import com.codexbridge.mobile.data.cbdp.utf8
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -76,16 +77,12 @@ class ApiClient(
         encodeDefaults = true
     }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .build()
+    // Shared process-wide HTTP stack: an ApiClient is created per route probe,
+    // per service and per re-pair, so a per-instance OkHttpClient multiplied
+    // connection pools and dispatcher threads.
+    private val client = SharedHttp.base
 
-    private val probeClient = client.newBuilder()
-        .readTimeout(3, TimeUnit.SECONDS)
-        .build()
+    private val probeClient = SharedHttp.probe
 
     private enum class Transport { UNKNOWN, CBDP, COMPANION }
 
@@ -165,7 +162,8 @@ class ApiClient(
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.2.5",
+                firmware = "1.2.6",
+                client = SharedHttp.stream,
             )
             cbdp = created
             return created
@@ -252,6 +250,18 @@ class ApiClient(
         transport = Transport.COMPANION
         cbdp?.close()
         cbdp = null
+    }
+
+    /**
+     * Release the CBDP socket/event stream owned by this instance.
+     *
+     * Callers replace `api` whenever the route or pairing changes, so without
+     * this the old instance kept its long-lived connection alive forever.
+     */
+    fun close() {
+        cbdp?.close()
+        cbdp = null
+        cleanupScope.cancel()
     }
 
     private suspend fun execute(methodId: Int, params: List<CbdpTlv> = emptyList()): CbdpCommand =
