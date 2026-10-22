@@ -152,6 +152,62 @@ class SettingsStore(context: Context) : CompletionNotificationState {
             .apply()
     }
 
+    // Phone-created threads stay invisible in the Bridge thread list until
+    // their first turn generates the rollout file. Remember them locally so a
+    // list refresh does not drop a thread the user just created.
+    fun recordPendingCreatedThread(thread: ThreadSummary) {
+        if (thread.thread_id.isBlank()) return
+        prefs.edit()
+            .putString("pending_created_title_" + thread.thread_id, thread.title)
+            .putString("pending_created_cwd_" + thread.thread_id, thread.cwd)
+            .putString("pending_created_model_" + thread.thread_id, thread.model)
+            .putLong(
+                "pending_created_at_" + thread.thread_id,
+                if (thread.created_at > 0) thread.created_at else System.currentTimeMillis() / 1000,
+            )
+            .apply()
+    }
+
+    fun pendingCreatedThreads(): List<ThreadSummary> {
+        val cutoff = System.currentTimeMillis() / 1000 - 24 * 3600
+        val ids = prefs.all.keys
+            .asSequence()
+            .filter { it.startsWith("pending_created_at_") }
+            .map { it.removePrefix("pending_created_at_") }
+            .toList()
+        val rows = mutableListOf<ThreadSummary>()
+        for (threadId in ids) {
+            val createdAt = prefs.getLong("pending_created_at_$threadId", 0L)
+            if (createdAt < cutoff) {
+                clearPendingCreatedThread(threadId)
+                continue
+            }
+            rows += ThreadSummary(
+                thread_id = threadId,
+                title = prefs.getString("pending_created_title_$threadId", "").orEmpty()
+                    .ifBlank { "新会话" },
+                preview = "",
+                status = "idle",
+                model = prefs.getString("pending_created_model_$threadId", "").orEmpty(),
+                cwd = prefs.getString("pending_created_cwd_$threadId", "").orEmpty(),
+                created_at = createdAt,
+                updated_at = createdAt,
+                recency_at = createdAt,
+            )
+        }
+        return rows
+    }
+
+    fun clearPendingCreatedThread(threadId: String) {
+        if (threadId.isBlank()) return
+        prefs.edit()
+            .remove("pending_created_title_$threadId")
+            .remove("pending_created_cwd_$threadId")
+            .remove("pending_created_model_$threadId")
+            .remove("pending_created_at_$threadId")
+            .apply()
+    }
+
     val isPaired: Boolean
         get() = baseUrl.isNotBlank() && token.isNotBlank()
 

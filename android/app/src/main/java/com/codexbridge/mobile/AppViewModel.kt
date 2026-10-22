@@ -506,7 +506,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
             .fold(
                 onSuccess = { response ->
-                    val visible = mergePendingThreads(response.threads, clearConfirmed = true)
+                    val listed = response.threads.map { it.thread_id }.toSet()
+                    // A phone-created thread stays invisible server-side until
+                    // its first turn; keep showing it until the list catches up.
+                    settings.pendingCreatedThreads().forEach { local ->
+                        if (local.thread_id in listed) {
+                            settings.clearPendingCreatedThread(local.thread_id)
+                        }
+                    }
+                    val carried = settings.pendingCreatedThreads()
+                        .filterNot { it.thread_id in listed }
+                    val visible = mergePendingThreads(carried + response.threads, clearConfirmed = true)
                     val normalized = visible.map(::normalizeUnconfirmedFailure).map { thread ->
                         val readOverride = settings.threadReadOverrideAt(thread.thread_id)
                         if (
@@ -1125,11 +1135,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (safeModel.isNotBlank()) {
                     settings.selectedModel = safeModel
                 }
+                // The Bridge cannot list a phone-created thread until its first
+                // turn writes the rollout file, so remember it locally or the
+                // next list refresh makes it vanish.
+                settings.recordPendingCreatedThread(thread)
+                val notice = if (created.desktop_handoff == "pending") {
+                    "新会话已创建；电脑端暂未接管，发出第一条消息后会自动同步"
+                } else {
+                    null
+                }
                 _state.update {
                     it.copy(
                         busy = false,
                         selectedModel = safeModel.ifBlank { it.selectedModel },
                         selectedCwd = projectCwd,
+                        notice = notice,
                         threads = listOf(thread) + it.threads.filterNot { row -> row.thread_id == thread.thread_id },
                     )
                 }

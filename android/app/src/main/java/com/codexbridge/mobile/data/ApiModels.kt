@@ -128,6 +128,9 @@ data class SendResponse(
 data class CreateThreadResponse(
     val ok: Boolean = false,
     val thread: ThreadSummary = ThreadSummary(),
+    // Bridge >= 2.1.29 returns "pending" when the desktop has not confirmed
+    // ownership yet; the thread exists and the first turn will sync it.
+    val desktop_handoff: String = "",
 )
 
 @Serializable
