@@ -411,7 +411,22 @@ private fun postCompletionNotification(context: Context, threadId: String, faile
         .setAutoCancel(true)
         .setCategory(NotificationCompat.CATEGORY_STATUS)
         .setPriority(NotificationCompat.PRIORITY_HIGH)
-    NotificationManagerCompat.from(context).notify(completionId(threadId), builder.build())
+    // Android 13+ requires POST_NOTIFICATIONS at runtime. MainActivity asks for
+    // it, but the user can deny or revoke it later, and this path also runs from
+    // a background service, so check before notifying and never let a rejected
+    // permission crash the listener.
+    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+        context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+        android.content.pm.PackageManager.PERMISSION_GRANTED
+    ) {
+        return
+    }
+    try {
+        NotificationManagerCompat.from(context).notify(completionId(threadId), builder.build())
+    } catch (_: SecurityException) {
+        // Revoked between the check and the post; dropping the notification is
+        // preferable to taking the foreground service down with it.
+    }
 }
 
 private fun createChannels(context: Context) {
