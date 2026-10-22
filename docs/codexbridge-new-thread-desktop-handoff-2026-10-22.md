@@ -114,3 +114,21 @@ else:
   随修复 1+2 上线后同类僵尸不会再产生）。
 - 探针手机 phone-185a6a411452 已通过 remove_phone 撤销。
 
+## 追加（2026-10-22 13:40，复测 Bridge 2.1.29 / 提交 7716b00）
+
+两处修复已生效，实测确认：
+
+1. `POST /api/companion/threads` 返回 200 + `"desktop_handoff": "pending"`，不再 503。
+2. `thread/name/set` 落盘成功：rollout 文件已生成
+   （`C:\Users\vencent\.codex\sessions\2026\10\22\rollout-2026-10-22T09-10-06-01a16128-7f36-7651-99df-fb88cce0679a.jsonl`，530 字节）。
+
+### 剩余问题（不紧急）
+
+`GET /api/companion/threads`（即 app-server `thread/list`）依然**不返回**这个已落盘的新线程：
+全量翻页扫了 118 行（cursor 到头），没有该线程；`thread/read` 详情接口反而正常（200，标题"新任务"）。
+
+也就是说新线程在第一轮 turn 之前，Bridge 列表永远看不到它。手机端 1.2.3 已在本地补偿
+（记住新建线程、出现在服务端列表后移除），所以不阻塞使用；但如果 Bridge 侧能让
+`thread/list` 包含已命名、有 rollout 的新线程，手机端补偿逻辑可以后续退役。
+
+探针手机已撤销。
