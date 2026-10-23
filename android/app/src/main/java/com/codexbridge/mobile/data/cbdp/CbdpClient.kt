@@ -108,6 +108,7 @@ class CbdpClient(
     @Volatile private var sseMode = false
     @Volatile private var closed = false
     private var heartbeatJob: Job? = null
+    private var retransmitJob: Job? = null
 
     // One reconnect at a time. Every listener callback used to schedule its own
     // reconnect, so a single outage could start several overlapping connects and
@@ -722,7 +723,10 @@ class CbdpClient(
     }
 
     private fun retransmitLoop() {
-        scope.launch {
+        // Every successful connect used to launch another loop that was never
+        // cancelled, so reconnects accumulated permanent 500ms timers.
+        retransmitJob?.cancel()
+        retransmitJob = scope.launch {
             while (!closed) {
                 delay(500)
                 val now = System.currentTimeMillis()
@@ -848,6 +852,8 @@ class CbdpClient(
         reconnectJob?.cancel()
         reconnectJob = null
         heartbeatJob?.cancel()
+        retransmitJob?.cancel()
+        retransmitJob = null
         socket?.close(1000, "bye")
         socket = null
         sseSource?.cancel()
@@ -871,6 +877,63 @@ class CbdpClient(
     private fun CbdpFrame.toJsonAdapter(): Unit = Unit
 
     companion object {
+        /**
+         * One CBDP client per (endpoint, device, token) for the whole process.
+         *
+         * The ViewModel and the completion listener both talk to the same
+         * Bridge, and each used to own a client, so the phone held two event
+         * streams (plus leaks). Sharing by key with reference counting keeps a
+         * single stream alive while either owner still needs it.
+         */
+        private data class SharedKey(
+            val baseUrl: String,
+            val deviceId: String,
+            val token: String,
+        )
+
+        private class SharedHandle(val client: CbdpClient) {
+            var refs: Int = 1
+        }
+
+        private val sharedLock = Any()
+        private val sharedClients = mutableMapOf<SharedKey, SharedHandle>()
+
+        fun obtain(
+            baseUrl: String,
+            deviceId: String,
+            token: String,
+            model: String,
+            firmware: String,
+            client: OkHttpClient,
+        ): CbdpClient {
+            val key = SharedKey(baseUrl, deviceId, token)
+            synchronized(sharedLock) {
+                sharedClients[key]?.let { handle ->
+                    handle.refs += 1
+                    return handle.client
+                }
+                val created = CbdpClient(baseUrl, deviceId, token, model, firmware, client)
+                sharedClients[key] = SharedHandle(created)
+                return created
+            }
+        }
+
+        /** Drop one reference; the underlying stream closes with the last one. */
+        fun release(candidate: CbdpClient) {
+            synchronized(sharedLock) {
+                val entry = sharedClients.entries.firstOrNull { it.value.client === candidate }
+                if (entry == null) {
+                    candidate.close()
+                    return
+                }
+                entry.value.refs -= 1
+                if (entry.value.refs <= 0) {
+                    sharedClients.remove(entry.key)
+                    candidate.close()
+                }
+            }
+        }
+
         private const val HANDSHAKE_TIMEOUT_MS = 12_000L
         private const val BASE_RECONNECT_DELAY_MS = 1_000L
         private const val MAX_RECONNECT_DELAY_MS = 30_000L

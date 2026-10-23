@@ -157,12 +157,12 @@ class ApiClient(
         if (current != null) return current
         synchronized(this) {
             cbdp?.let { return it }
-            val created = CbdpClient(
+            val created = CbdpClient.obtain(
                 baseUrl = base,
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.2.6",
+                firmware = "1.2.7",
                 client = SharedHttp.stream,
             )
             cbdp = created
@@ -248,7 +248,7 @@ class ApiClient(
 
     private fun fallBackToCompanion() {
         transport = Transport.COMPANION
-        cbdp?.close()
+        cbdp?.let { CbdpClient.release(it) }
         cbdp = null
     }
 
@@ -259,7 +259,7 @@ class ApiClient(
      * this the old instance kept its long-lived connection alive forever.
      */
     fun close() {
-        cbdp?.close()
+        cbdp?.let { CbdpClient.release(it) }
         cbdp = null
         cleanupScope.cancel()
     }

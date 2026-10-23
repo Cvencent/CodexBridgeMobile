@@ -2058,6 +2058,27 @@ working = if (activeMatches) {
         return base + Random.nextLong(0L, 1_000L)
     }
 
+    /**
+     * The ViewModel is destroyed when the last activity finishes, but the
+     * process (and the notification service) can outlive it. Release this
+     * owner's CBDP reference so a reopened app cannot accumulate clients.
+     */
+    override fun onCleared() {
+        threadsJob?.cancel()
+        screenStreamJob?.cancel()
+        streamJob?.cancel()
+        pollJob?.cancel()
+        routeRefreshJob?.cancel()
+        threadsJob = null
+        screenStreamJob = null
+        streamJob = null
+        pollJob = null
+        routeRefreshJob = null
+        api?.close()
+        api = null
+        super.onCleared()
+    }
+
     companion object {
         private const val THREADS_REFRESH_MS = 30_000L
         private const val THREAD_POLL_MS = 30_000L
