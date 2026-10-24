@@ -154,6 +154,28 @@ class CbdpClient(
         val scope: Int,
     )
 
+    /**
+     * Drop the current transport and dial again.
+     *
+     * A phone that sat in the background for hours comes back with a socket the
+     * peer already forgot: no callback fires, `session.state` still says READY,
+     * and [connect] short-circuits, so every command is written into a dead
+     * connection and eventually reports a timeout. A fresh process used to be
+     * the only cure; this is the explicit one.
+     */
+    suspend fun reconnect() {
+        synchronized(reconnectGuard) {
+            reconnectAttempt = 0
+            retryAfterAtMs = 0
+        }
+        connectLock.withLock {
+            closed = false
+            releaseStreams()
+            session.markDisconnected()
+        }
+        connect()
+    }
+
     suspend fun connect() = connectLock.withLock {
         if (session.state == CbdpSessionState.READY && (!sseMode || sseSource != null)) return@withLock
         closed = false

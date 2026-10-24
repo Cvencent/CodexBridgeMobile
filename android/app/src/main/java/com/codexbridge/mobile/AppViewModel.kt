@@ -152,14 +152,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var streamJob: Job? = null
     private var screenStreamJob: Job? = null
     private var pollJob: Job? = null
+    private var hydrationJob: Job? = null
     private var threadsJob: Job? = null
     private val refreshLock = Mutex()
     private var foreground = false
+    /** Wall clock of the last background transition, used to detect dead sockets. */
+    private var backgroundedAtMs = 0L
     private val failureConfirmations = mutableMapOf<String, Job>()
 
     fun setForeground(visible: Boolean) {
         if (!visible) {
             foreground = false
+            backgroundedAtMs = System.currentTimeMillis()
             threadsJob?.cancel()
             threadsJob = null
             screenStreamJob?.cancel()
@@ -168,11 +172,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             streamJob = null
             pollJob?.cancel()
             pollJob = null
+            hydrationJob?.cancel()
+            hydrationJob = null
             routeRefreshJob?.cancel()
             routeRefreshJob = null
             return
         }
         foreground = visible
+        val awayMs = if (backgroundedAtMs > 0) {
+            System.currentTimeMillis() - backgroundedAtMs
+        } else {
+            0L
+        }
+        backgroundedAtMs = 0
         val current = _state.value
         val mergedThreads = mergePendingThreads(current.threads)
         val mergedActive = current.activeThread?.let { active ->
@@ -198,6 +210,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         refreshConnectionRoute()
+        if (awayMs >= STALE_CONNECTION_AFTER_MS) {
+            // Doze/NAT drops the socket while the process sleeps, and no
+            // callback wakes the client up, so the session still claims READY
+            // and every command times out until the app is restarted.
+            viewModelScope.launch {
+                runCatching { api?.reconnectCbdp() }
+                if (_state.value.screen == AppScreen.Threads && foreground) {
+                    refreshThreads()
+                }
+            }
+        }
         when (_state.value.screen) {
             AppScreen.Threads -> startThreadsRefresh()
             AppScreen.Chat -> _state.value.activeThread?.thread_id?.takeIf { it.isNotBlank() }?.let(::observeThread)
@@ -556,16 +579,40 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         val ok = fetchAndUpdate()
 
-        // The Bridge's app-server can return thread stubs with blank titles
-        // right after a restart while it hydrates metadata from rollout logs.
-        // Retry once so the user doesn't see a list of unnamed tasks.
-        val threads = _state.value.threads
-        if (ok && threads.isNotEmpty() && threads.all { it.title.isBlank() }) {
-            delay(3000)
-            fetchAndUpdate()
+        // The Bridge's app-server reports placeholder titles while it hydrates
+        // metadata from rollout logs, and its read cache can hold that page for
+        // up to 30s. A single 3s retry landed inside that window, so the list
+        // stayed "未命名任务" until the user refreshed by hand.
+        if (ok) {
+            val threads = _state.value.threads
+            if (threads.isNotEmpty() && threads.all { isPlaceholderTitle(it.title) }) {
+                scheduleTitleHydration()
+            }
         }
 
         ok
+    }
+
+    /**
+     * Re-fetch placeholders on a delay schedule that outlives the Bridge's read
+     * cache. Runs as its own job so a manual refresh is never blocked.
+     */
+    private fun scheduleTitleHydration() {
+        if (hydrationJob?.isActive == true) return
+        hydrationJob = viewModelScope.launch {
+            for (waitMs in PLACEHOLDER_TITLE_RETRY_DELAYS) {
+                if (!foreground || _state.value.screen != AppScreen.Threads) return@launch
+                val threads = _state.value.threads
+                if (threads.isEmpty() || !threads.all { isPlaceholderTitle(it.title) }) return@launch
+                delay(waitMs)
+                refreshThreads()
+            }
+        }
+    }
+
+    private fun isPlaceholderTitle(title: String): Boolean {
+        val trimmed = title.trim()
+        return trimmed.isEmpty() || trimmed == "未命名任务" || trimmed == "新任务"
     }
 
     private fun loadModels() {
@@ -2068,7 +2115,9 @@ working = if (activeMatches) {
         screenStreamJob?.cancel()
         streamJob?.cancel()
         pollJob?.cancel()
+        hydrationJob?.cancel()
         routeRefreshJob?.cancel()
+        hydrationJob = null
         threadsJob = null
         screenStreamJob = null
         streamJob = null
@@ -2081,6 +2130,10 @@ working = if (activeMatches) {
 
     companion object {
         private const val THREADS_REFRESH_MS = 30_000L
+        /** Past this, assume the platform dropped the socket while we slept. */
+        private const val STALE_CONNECTION_AFTER_MS = 2 * 60_000L
+        /** ~36s total, enough to outlive the Bridge's 30s terminal read cache. */
+        private val PLACEHOLDER_TITLE_RETRY_DELAYS = longArrayOf(1_000L, 5_000L, 10_000L, 20_000L)
         private const val THREAD_POLL_MS = 30_000L
         private const val FAILURE_CONFIRMATION_DELAY_MS = 2_500L
         private const val REFRESH_TIMEOUT_MS = 20_000L

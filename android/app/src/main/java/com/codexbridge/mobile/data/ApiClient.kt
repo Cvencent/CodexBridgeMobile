@@ -162,7 +162,7 @@ class ApiClient(
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.2.7",
+                firmware = "1.2.8",
                 client = SharedHttp.stream,
             )
             cbdp = created
@@ -258,6 +258,16 @@ class ApiClient(
      * Callers replace `api` whenever the route or pairing changes, so without
      * this the old instance kept its long-lived connection alive forever.
      */
+    /**
+     * Re-establish the CBDP transport when the app comes back from a long
+     * background stay. Companion HTTP needs nothing: it has no live socket.
+     */
+    suspend fun reconnectCbdp() {
+        if (resolveTransport() != Transport.CBDP) return
+        val client = cbdp ?: ensureCbdp()
+        client.reconnect()
+    }
+
     fun close() {
         cbdp?.let { CbdpClient.release(it) }
         cbdp = null
