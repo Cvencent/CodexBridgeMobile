@@ -122,6 +122,25 @@ const val LOCAL_MESSAGE_TTL_SECONDS = 5 * 60L
 fun isLocalMessage(message: MessageItem): Boolean =
     message.id.startsWith(LOCAL_MESSAGE_PREFIX)
 
+/**
+ * Completion timestamp that should raise a notification, in epoch seconds.
+ *
+ * The thread status cannot be used: the Bridge reports "idle" as soon as any
+ * device reads the task, which usually happens before the notification poll
+ * runs. The completion timestamp is the only stable signal, so a finished task
+ * still alerts when it is already idle.
+ *
+ * CBDP sends `*_at` values in milliseconds while the rest of the app stores
+ * epoch seconds; normalise here so watermarks stay comparable.
+ */
+fun notificationCompletedAt(thread: ThreadSummary): Long {
+    val raw = thread.completed_at
+    val seconds = if (raw > 100_000_000_000L) raw / 1000 else raw
+    if (seconds <= 0) return 0
+    if (thread.status == "working" || thread.status == "waiting_user") return 0
+    return seconds
+}
+
 /** Map a `thread/status/changed` payload onto the task status vocabulary. */
 fun threadStatusToTaskStatus(status: String, activeFlags: List<String>, current: String): String =
     when {

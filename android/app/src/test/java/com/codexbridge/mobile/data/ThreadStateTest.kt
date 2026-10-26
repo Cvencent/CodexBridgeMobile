@@ -223,3 +223,37 @@ class MergeServerMessagesTest {
         assertFalse(merged.any(::isLocalMessage))
     }
 }
+
+class NotificationCompletedAtTest {
+    private fun thread(status: String, completedAt: Long) =
+        ThreadSummary(thread_id = "t1", status = status, completed_at = completedAt)
+
+    @Test
+    fun idleThreadStillReportsItsCompletion() {
+        // The Bridge flips to idle once any device reads the task, so an idle
+        // thread with a completion timestamp must still alert.
+        assertEquals(1_792_723_196L, notificationCompletedAt(thread("idle", 1_792_723_196L)))
+    }
+
+    @Test
+    fun completedAndFailedThreadsReportTheirCompletion() {
+        assertEquals(1_792_723_196L, notificationCompletedAt(thread("completed", 1_792_723_196L)))
+        assertEquals(1_792_723_196L, notificationCompletedAt(thread("failed", 1_792_723_196L)))
+    }
+
+    @Test
+    fun aRunningThreadNeverReportsACompletion() {
+        assertEquals(0L, notificationCompletedAt(thread("working", 1_792_723_196L)))
+        assertEquals(0L, notificationCompletedAt(thread("waiting_user", 1_792_723_196L)))
+    }
+
+    @Test
+    fun millisecondTimestampsAreNormalisedToSeconds() {
+        assertEquals(1_792_723_196L, notificationCompletedAt(thread("completed", 1_792_723_196_000L)))
+    }
+
+    @Test
+    fun aThreadWithoutACompletionDoesNotAlert() {
+        assertEquals(0L, notificationCompletedAt(thread("idle", 0L)))
+    }
+}

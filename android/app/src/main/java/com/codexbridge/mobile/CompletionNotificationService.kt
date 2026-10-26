@@ -26,6 +26,7 @@ import com.codexbridge.mobile.data.ConnectionRoute
 import com.codexbridge.mobile.data.ConnectionSelector
 import com.codexbridge.mobile.data.CompletionNotificationTracker
 import com.codexbridge.mobile.data.SettingsStore
+import com.codexbridge.mobile.data.notificationCompletedAt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -219,12 +220,12 @@ class CompletionNotificationService : Service() {
         settings: SettingsStore,
         completions: CompletionNotificationTracker,
     ) {
+        var attempt = 0
         while (scope.isActive) {
             if (isAppForeground()) {
                 delay(2_000L)
                 continue
             }
-            var attempt = 0
             try {
                 val client = clientFor(settings)
                 var streamFailed = false
@@ -245,31 +246,37 @@ class CompletionNotificationService : Service() {
                                 settings.clearPendingCompletion(event.thread_id)
                                 return@collect
                             }
-                            if (event.turn_id.isBlank() && event.completed_at <= 0) return@collect
+                            val completedAt = epochSeconds(event.completed_at)
+                            if (event.turn_id.isBlank() && completedAt <= 0) return@collect
                             val failed = event.status == "failed"
                             if (!completions.shouldNotify(
                                     event.thread_id,
                                     event.turn_id,
-                                    event.completed_at,
+                                    completedAt,
                                 )
                             ) return@collect
                             notifyCompletion(
                                 event.thread_id,
                                 failed,
-                                event.completed_at.takeIf { it > 0 } ?: System.currentTimeMillis() / 1000,
+                                completedAt.takeIf { it > 0 } ?: System.currentTimeMillis() / 1000,
                             )
                         }
                         "thread_status" -> {
-                            // Another client (phone or ESP device) marked the task
-                            // read, so drop this device's pending alert.
-                            if (event.thread_id.isNotBlank() && event.status == "idle") {
+                            if (event.thread_id.isBlank()) return@collect
+                            if (event.status == "idle") {
+                                // Another client (phone or ESP device) marked the
+                                // task read, so drop this device's pending alert.
                                 cancelCompletion(event.thread_id)
                                 settings.clearPendingCompletion(event.thread_id)
-                            } else if (
-                                event.thread_id.isNotBlank() &&
-                                (event.status == "active" || event.active_flags.isNotEmpty())
-                            ) {
+                            } else if (event.status == "active" || event.active_flags.isNotEmpty()) {
                                 settings.clearPendingCompletion(event.thread_id)
+                            } else if (event.status == "completed" || event.status == "failed") {
+                                // Terminal summaries arrive here in real time; the
+                                // payload has no timestamp, so read the list once to
+                                // get completed_at instead of waiting for the poll.
+                                scope.launch {
+                                    runCatching { checkCompletions(settings, completions) }
+                                }
                             }
                         }
                     }
@@ -298,27 +305,8 @@ class CompletionNotificationService : Service() {
             delay(POLL_MS)
             if (isAppForeground()) continue
             try {
-                val client = clientFor(settings)
-                val threads = client.threads().threads
+                checkCompletions(settings, completions)
                 attempt = 0
-                if (!baselineReady) {
-                    // The first snapshot is history, not a completion. If the
-                    // service started while offline, establish the baseline on
-                    // the first successful poll instead of replaying it.
-                    val startedAt = System.currentTimeMillis() / 1000
-                    completions.seed(threads, beforeOrAt = startedAt)
-                    baselineReady = true
-                } else {
-                    threads.forEach { thread ->
-                        val failed = thread.status == "failed"
-                        if ((!failed && thread.status != "completed") || thread.completed_at <= 0) {
-                            return@forEach
-                        }
-                        if (completions.shouldNotify(thread.thread_id, thread.turn_id, thread.completed_at)) {
-                            notifyCompletion(thread.thread_id, failed, thread.completed_at)
-                        }
-                    }
-                }
             } catch (_: Exception) {
                 resetCachedClient()
                 attempt += 1
@@ -326,6 +314,46 @@ class CompletionNotificationService : Service() {
             }
         }
     }
+
+    /**
+     * Alert for every thread whose completion is newer than the last one seen.
+     *
+     * The thread status cannot be trusted here: the Bridge reports "idle" as soon
+     * as any device reads the task, which is usually before the next poll runs.
+     * `completed_at` is the only stable signal, so a finished task is detected
+     * even when it is already idle by the time this snapshot arrives.
+     */
+    private suspend fun checkCompletions(
+        settings: SettingsStore,
+        completions: CompletionNotificationTracker,
+    ) {
+        val client = clientFor(settings)
+        val threads = client.threads().threads
+        if (!baselineReady) {
+            // The first snapshot is history, not a completion. If the service
+            // started while offline, establish the baseline on the first
+            // successful poll instead of replaying it.
+            val startedAt = System.currentTimeMillis() / 1000
+            completions.seed(threads, beforeOrAt = startedAt)
+            baselineReady = true
+            return
+        }
+        threads.forEach { thread ->
+            val completedAt = notificationCompletedAt(thread)
+            if (completedAt <= 0) return@forEach
+            val failed = thread.status == "failed"
+            if (completions.shouldNotify(thread.thread_id, thread.turn_id, completedAt)) {
+                notifyCompletion(thread.thread_id, failed, completedAt)
+            }
+        }
+    }
+
+    /**
+     * CBDP carries `*_at` values in milliseconds while the rest of the app (and
+     * the persisted watermarks) use epoch seconds. Normalise before comparing.
+     */
+    private fun epochSeconds(value: Long): Long =
+        if (value > 100_000_000_000L) value / 1000 else value
 
     private fun isAppForeground(): Boolean {
         return AppForeground.visible
