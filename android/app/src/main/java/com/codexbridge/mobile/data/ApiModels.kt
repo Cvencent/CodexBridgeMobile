@@ -18,6 +18,8 @@ data class PingResponse(
     val port: Int = 0,
     val discovery_port: Int = 0,
     val requires_pairing: Boolean = false,
+    @SerialName("bridge_instance_id") val bridgeInstanceId: String = "",
+    @SerialName("device_id") val deviceId: String = "",
     @SerialName("cbdp_v1") val cbdpV1: CbdpCapability? = null,
 )
 
@@ -47,6 +49,8 @@ data class BridgeInfo(
     val name: String = "",
     val version: String = "",
     val port: Int = 0,
+    @SerialName("bridge_instance_id") val bridgeInstanceId: String = "",
+    @SerialName("device_id") val deviceId: String = "",
 )
 
 @Serializable

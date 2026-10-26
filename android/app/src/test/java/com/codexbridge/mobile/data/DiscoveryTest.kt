@@ -9,6 +9,8 @@ import com.codexbridge.mobile.data.cbdp.CbdpTlv
 import com.codexbridge.mobile.data.cbdp.bytes
 import com.codexbridge.mobile.data.cbdp.u16
 import com.codexbridge.mobile.data.cbdp.utf8
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -48,5 +50,92 @@ class DiscoveryTest {
             tlvs = listOf(CbdpTlv(CbdpTag.DISCOVERY_NONCE, nonce)),
         )
         assertFalse(Discovery.isMatchingReplyForTest(CbdpCodec.encode(frame), nonce))
+    }
+}
+
+class BridgeIdentityMatchTest {
+    private fun bridge(
+        host: String,
+        port: Int = 8568,
+        name: String = "DESKTOP-A",
+        version: String = "2.1.33",
+        instance: String = "aa",
+    ) = DiscoveredBridge(
+        host = host,
+        port = port,
+        name = name,
+        version = version,
+        deviceId = "bridge-$instance",
+        bridgeInstanceId = ByteArray(16) { instance.toInt(16).toByte() },
+    )
+
+    @Test
+    fun instanceIdIsAuthoritativeEvenWhenTheNameChanged() {
+        val discovered = listOf(bridge("192.168.0.49", name = "renamed"))
+        val match = matchDiscoveredBridge(
+            discovered = discovered,
+            storedInstanceId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.1.33",
+            storedPort = 8568,
+        )
+        assertEquals("192.168.0.49", match?.bridge?.host)
+        assertEquals(false, match?.adoptedIdentity)
+    }
+
+    @Test
+    fun sameNameButDifferentInstanceIsNeverAdopted() {
+        val discovered = listOf(bridge("192.168.0.50", instance = "bb"))
+        val match = matchDiscoveredBridge(
+            discovered = discovered,
+            storedInstanceId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.1.33",
+            storedPort = 8568,
+        )
+        assertNull(match)
+    }
+
+    @Test
+    fun legacyRecordIsUpgradedWhenExactlyOneCandidateMatches() {
+        val discovered = listOf(bridge("192.168.0.49", instance = "cc"))
+        val match = matchDiscoveredBridge(
+            discovered = discovered,
+            storedInstanceId = "",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.1.33",
+            storedPort = 8568,
+        )
+        assertEquals("192.168.0.49", match?.bridge?.host)
+        assertEquals(true, match?.adoptedIdentity)
+    }
+
+    @Test
+    fun legacyRecordStaysUnmatchedWhenTheMatchIsAmbiguous() {
+        val discovered = listOf(
+            bridge("192.168.0.49", instance = "cc"),
+            bridge("192.168.0.50", instance = "dd"),
+        )
+        val match = matchDiscoveredBridge(
+            discovered = discovered,
+            storedInstanceId = "",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.1.33",
+            storedPort = 8568,
+        )
+        assertNull(match)
+    }
+
+    @Test
+    fun legacyRecordWithoutAnyCandidateStaysUnmatched() {
+        val discovered = listOf(bridge("192.168.0.49", name = "OTHER", instance = "cc"))
+        val match = matchDiscoveredBridge(
+            discovered = discovered,
+            storedInstanceId = "",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.1.33",
+            storedPort = 8568,
+        )
+        assertNull(match)
     }
 }

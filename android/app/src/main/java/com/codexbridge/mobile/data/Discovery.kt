@@ -58,6 +58,44 @@ data class DiscoveredBridge(
     }
 }
 
+/** Stable hex form of the 16-byte bridge instance id carried by discovery. */
+val DiscoveredBridge.instanceIdHex: String
+    get() = bridgeInstanceId.joinToString("") { it.toUByte().toString(16).padStart(2, '0') }
+
+data class BridgeMatch(
+    val bridge: DiscoveredBridge,
+    /** True when the stored record had no instance id and was upgraded here. */
+    val adoptedIdentity: Boolean,
+)
+
+/**
+ * Pick the discovered Bridge that owns the stored pairing.
+ *
+ * A matching instance id is authoritative. Records written before the Bridge
+ * exposed one may only be adopted when name, version and port identify exactly
+ * one candidate: sending a token to a different Bridge with the same computer
+ * name would hand it to a stranger.
+ */
+fun matchDiscoveredBridge(
+    discovered: List<DiscoveredBridge>,
+    storedInstanceId: String,
+    storedName: String,
+    storedVersion: String,
+    storedPort: Int,
+): BridgeMatch? {
+    val expected = storedInstanceId.trim().lowercase()
+    if (expected.isNotBlank()) {
+        val hit = discovered.firstOrNull { it.instanceIdHex == expected } ?: return null
+        return BridgeMatch(hit, adoptedIdentity = false)
+    }
+    if (storedName.isBlank()) return null
+    val candidates = discovered.filter {
+        it.name == storedName && it.version == storedVersion && it.port == storedPort
+    }
+    if (candidates.size != 1) return null
+    return BridgeMatch(candidates.single(), adoptedIdentity = true)
+}
+
 object Discovery {
     private const val TIMEOUT_MS = 3500L
     private const val MAX_DISCOVERY_BYTES = 1024

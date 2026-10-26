@@ -41,6 +41,8 @@ import com.codexbridge.mobile.data.normalizeUnconfirmedFailure
 import com.codexbridge.mobile.data.confirmedPendingCompletionIds
 import com.codexbridge.mobile.data.mergePendingCompletions
 import com.codexbridge.mobile.data.sortThreadsByActivity
+import com.codexbridge.mobile.data.matchDiscoveredBridge
+import com.codexbridge.mobile.data.instanceIdHex
 import com.codexbridge.mobile.data.mergeServerMessages
 import com.codexbridge.mobile.data.LOCAL_MESSAGE_PREFIX
 import com.codexbridge.mobile.data.isLocalMessage
@@ -153,6 +155,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var screenStreamJob: Job? = null
     private var pollJob: Job? = null
     private var hydrationJob: Job? = null
+    private var rediscoveryJob: Job? = null
     private var threadsJob: Job? = null
     private val refreshLock = Mutex()
     private var foreground = false
@@ -302,8 +305,102 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         observeThread(threadId)
                     }
                 }
+            } else {
+                // Every stored address failed. The Bridge may simply have a new
+                // IP, so look for the same instance before showing an error.
+                when (rediscoverBridge()) {
+                    RediscoveryOutcome.Migrated -> {
+                        if (_state.value.screen == AppScreen.Threads) refreshThreads()
+                        val threadId = _state.value.activeThread?.thread_id
+                        if (_state.value.screen == AppScreen.Chat && !threadId.isNullOrBlank()) {
+                            observeThread(threadId)
+                        }
+                    }
+                    RediscoveryOutcome.TokenRejected -> promptRepair("配对令牌已失效，请重新配对")
+                    RediscoveryOutcome.NotFound -> _state.update {
+                        it.copy(connected = false)
+                    }
+                }
             }
         }
+    }
+
+    private enum class RediscoveryOutcome {
+        /** Found the same Bridge at a new address and the old token works. */
+        Migrated,
+
+        /** Same Bridge answered, but it rejected the stored token. */
+        TokenRejected,
+
+        /** Nothing matched: keep the pairing and report a network problem. */
+        NotFound,
+    }
+
+    /**
+     * Re-locate the paired Bridge after its address changed.
+     *
+     * The token is bound to the phone record, not to an IP, so a discovered
+     * instance with the stored `bridge_instance_id` may keep using it. Only a
+     * 401 from that same instance means the pairing is really gone.
+     */
+    private suspend fun rediscoverBridge(): RediscoveryOutcome {
+        if (!settings.isPaired) return RediscoveryOutcome.NotFound
+        val found = runCatching {
+            Discovery.discover(
+                discoveryPort = settings.discoveryPort,
+                deviceId = settings.phoneId.ifBlank { settings.installationId },
+            )
+        }.getOrDefault(emptyList())
+        if (found.isEmpty()) return RediscoveryOutcome.NotFound
+
+        val storedPort = runCatching {
+            java.net.URI(ApiClient.normalizeBase(settings.baseUrl)).port
+                .takeIf { it > 0 } ?: ApiClient.DEFAULT_PORT
+        }.getOrDefault(ApiClient.DEFAULT_PORT)
+        val match = matchDiscoveredBridge(
+            discovered = found,
+            storedInstanceId = settings.bridgeInstanceId,
+            storedName = settings.bridgeName,
+            storedVersion = settings.bridgeVersion,
+            storedPort = storedPort,
+        ) ?: return RediscoveryOutcome.NotFound
+
+        val newBase = match.bridge.baseUrl
+        val token = settings.token
+        val phoneId = settings.phoneId
+        val client = ApiClient(newBase, token, phoneId)
+        val verified = runCatching { client.threads() }
+        if (verified.isFailure) {
+            val error = verified.exceptionOrNull()
+            val rejected = error is ApiException && error.unauthorized
+            // The address is already known to be this Bridge, so remember it
+            // even when the token is dead; only the pairing needs redoing.
+            settings.baseUrl = newBase
+            settings.lastSuccessfulUrl = newBase
+            // The probe may have opened a CBDP stream; do not leak it.
+            client.close()
+            return if (rejected) RediscoveryOutcome.TokenRejected else RediscoveryOutcome.NotFound
+        }
+
+        settings.baseUrl = newBase
+        settings.lanUrl = newBase
+        settings.lastSuccessfulUrl = newBase
+        settings.bridgeInstanceId = match.bridge.instanceIdHex
+        if (match.bridge.deviceId.isNotBlank()) settings.bridgeDeviceId = match.bridge.deviceId
+        if (match.bridge.name.isNotBlank()) settings.bridgeName = match.bridge.name
+        if (match.bridge.version.isNotBlank()) settings.bridgeVersion = match.bridge.version
+        api?.close()
+        api = client
+        _state.update {
+            it.copy(
+                baseUrl = newBase,
+                lanUrl = newBase,
+                activeRouteRole = "lan",
+                connected = true,
+                error = null,
+            )
+        }
+        return RediscoveryOutcome.Migrated
     }
 
     private fun isOnWifi(): Boolean {
@@ -374,6 +471,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings.phoneId = response.phone_id
                 settings.bridgeName = response.bridge.name.ifBlank { ping.name }
                 settings.bridgeVersion = response.bridge.version.ifBlank { ping.version }
+                // Stable identity lets a later IP/port change find this same
+                // Bridge again instead of asking the user to pair a second time.
+                settings.bridgeInstanceId =
+                    response.bridge.bridgeInstanceId.ifBlank { ping.bridgeInstanceId }
+                settings.bridgeDeviceId =
+                    response.bridge.deviceId.ifBlank { ping.deviceId }
                 settings.phoneId = response.phone_id
                 api?.close()
                 api = ApiClient(resolved.base, response.token, response.phone_id)
@@ -2061,29 +2164,30 @@ working = if (activeMatches) {
     private fun handleError(error: Throwable) {
         val unauthorized = error is ApiException && error.unauthorized
         if (unauthorized && _state.value.screen != AppScreen.Pair) {
-            // The pairing token is genuinely dead (bridge store reset, phone
-            // record deleted, or rotated past the grace window). Navigation to
-            // the Pair screen is the only useful response — retrying with the
-            // same token will keep failing. Saved addresses are pre-filled so
-            // the user just needs a new pairing code.
-            streamJob?.cancel()
-            pollJob?.cancel()
-            threadsJob?.cancel()
-            screenStreamJob?.cancel()
-            threadsJob = null
-            screenStreamJob = null
-            _state.update {
-                it.copy(
-                    error = friendly(error),
-                    connected = false,
-                    screen = AppScreen.Pair,
-                    activeThread = null,
-                    messages = emptyList(),
-                    streaming = emptyMap(),
-                    approvals = emptyList(),
-                    busy = false,
-                    sending = false,
-                )
+            // A 401 no longer means "re-pair" on its own: the stored address may
+            // point at a different machine after a DHCP change. Re-discover
+            // first and only ask for a new code when the same Bridge instance
+            // still rejects the token.
+            if (rediscoveryJob?.isActive != true) {
+                rediscoveryJob = viewModelScope.launch {
+                    when (rediscoverBridge()) {
+                        RediscoveryOutcome.Migrated -> {
+                            _state.update { it.copy(error = null, connected = true) }
+                            if (_state.value.screen == AppScreen.Threads) refreshThreads()
+                            val threadId = _state.value.activeThread?.thread_id
+                            if (_state.value.screen == AppScreen.Chat && !threadId.isNullOrBlank()) {
+                                observeThread(threadId)
+                            }
+                        }
+                        RediscoveryOutcome.TokenRejected -> promptRepair(friendly(error))
+                        RediscoveryOutcome.NotFound -> _state.update {
+                            it.copy(
+                                error = "找不到已配对的 Codex Bridge，请确认手机和电脑在同一网络",
+                                connected = false,
+                            )
+                        }
+                    }
+                }
             }
             return
         }
@@ -2091,6 +2195,33 @@ working = if (activeMatches) {
             it.copy(
                 error = friendly(error),
                 connected = if (unauthorized) false else it.connected,
+            )
+        }
+    }
+
+    /**
+     * The same Bridge instance rejected the stored token (store reset, phone
+     * record deleted, or rotated past the grace window), so a new pairing code
+     * is genuinely required. Saved addresses stay pre-filled.
+     */
+    private fun promptRepair(message: String) {
+        streamJob?.cancel()
+        pollJob?.cancel()
+        threadsJob?.cancel()
+        screenStreamJob?.cancel()
+        threadsJob = null
+        screenStreamJob = null
+        _state.update {
+            it.copy(
+                error = message,
+                connected = false,
+                screen = AppScreen.Pair,
+                activeThread = null,
+                messages = emptyList(),
+                streaming = emptyMap(),
+                approvals = emptyList(),
+                busy = false,
+                sending = false,
             )
         }
     }

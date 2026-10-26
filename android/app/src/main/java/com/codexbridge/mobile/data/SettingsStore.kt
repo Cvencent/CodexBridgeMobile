@@ -64,6 +64,20 @@ class SettingsStore(context: Context) : CompletionNotificationState {
         get() = prefs.getString("bridge_name", "") ?: ""
         set(value) = prefs.edit().putString("bridge_name", value).apply()
 
+    /**
+     * Stable identity of the paired Bridge. Survives an IP or port change, so a
+     * new address can be matched back to the same machine instead of asking the
+     * user to pair again.
+     */
+    var bridgeInstanceId: String
+        get() = prefs.getString("bridge_instance_id", "") ?: ""
+        set(value) = prefs.edit().putString("bridge_instance_id", value).apply()
+
+    /** `bridge-<12>` device id published alongside the instance id. */
+    var bridgeDeviceId: String
+        get() = prefs.getString("bridge_device_id", "") ?: ""
+        set(value) = prefs.edit().putString("bridge_device_id", value).apply()
+
     var bridgeVersion: String
         get() = prefs.getString("bridge_version", "") ?: ""
         set(value) = prefs.edit().putString("bridge_version", value).apply()
