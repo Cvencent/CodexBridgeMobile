@@ -111,7 +111,13 @@ object Discovery {
         bridgePort: Int = ApiClient.DEFAULT_PORT,
     ): List<DiscoveredBridge> =
         withContext(Dispatchers.IO) {
-            val socket = DatagramSocket()
+            // Android keeps mobile data alive while Wi-Fi is connected, and an
+            // unbound UDP socket may then send the broadcast out of the cellular
+            // interface, where no Bridge can answer. Pin the socket to the Wi-Fi
+            // address so discovery always leaves through the LAN.
+            val socket = wifiBindAddress()
+                ?.let { address -> runCatching { DatagramSocket(0, address) }.getOrNull() }
+                ?: DatagramSocket()
             try {
                 socket.broadcast = true
                 socket.soTimeout = 400
@@ -267,6 +273,16 @@ object Discovery {
         val instance = bridge.bridgeInstanceId.joinToString("") { it.toUByte().toString(16).padStart(2, '0') }
         return "$instance:${bridge.deviceId}"
     }
+
+    /** First site-local IPv4 address on a Wi-Fi style interface, if any. */
+    private fun wifiBindAddress(): InetAddress? = runCatching {
+        NetworkInterface.getNetworkInterfaces().toList()
+            .filter { it.isUp && !it.isLoopback }
+            .filter { it.name.startsWith("wlan") || it.name.startsWith("ap") }
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress }
+    }.getOrNull()
 
     private fun broadcastTargets(): List<String> {
         val targets = linkedSetOf("255.255.255.255")
