@@ -98,6 +98,7 @@ fun matchDiscoveredBridge(
 
 object Discovery {
     private const val TIMEOUT_MS = 3500L
+    private const val SWEEP_TIMEOUT_MS = 2500L
     private const val MAX_DISCOVERY_BYTES = 1024
     private const val SCOPE_SUBNET = 1
     private val LEGACY_REQUEST = "CODEXBRIDGE_COMPANION_DISCOVER".toByteArray(Charsets.US_ASCII)
@@ -123,8 +124,42 @@ object Discovery {
                 socket.soTimeout = 400
                 val nonce = ByteArray(16).also(random::nextBytes)
                 val request = discoveryRequest(nonce, deviceId, bridgePort)
-                val targets = broadcastTargets()
                 val found = linkedMapOf<String, DiscoveredBridge>()
+
+                fun consume(packet: DatagramPacket) {
+                    val reply = parseReply(
+                        packet.data.copyOfRange(0, packet.length),
+                        nonce,
+                    ) ?: return
+                    val host = packet.address?.hostAddress ?: return
+                    val bridge = DiscoveredBridge(
+                        host = host,
+                        port = reply.port,
+                        name = reply.model.ifBlank { reply.deviceId },
+                        version = reply.firmware,
+                        deviceId = reply.deviceId,
+                        bridgeInstanceId = reply.bridgeInstanceId,
+                    )
+                    found[dedupeKey(bridge)] = bridge
+                }
+
+                fun pump(until: Long) {
+                    while (System.currentTimeMillis() < until) {
+                        val response = DatagramPacket(
+                            ByteArray(MAX_DISCOVERY_BYTES),
+                            MAX_DISCOVERY_BYTES,
+                        )
+                        try {
+                            socket.receive(response)
+                        } catch (_error: SocketTimeoutException) {
+                            continue
+                        }
+                        consume(response)
+                    }
+                }
+
+                // Phase 1: the normal broadcast probe.
+                val targets = broadcastTargets()
                 val deadline = System.currentTimeMillis() + timeoutMs
                 var nextSend = 0L
                 while (System.currentTimeMillis() < deadline) {
@@ -146,23 +181,35 @@ object Discovery {
                         }
                         nextSend = now + 650L
                     }
-                    val response = DatagramPacket(ByteArray(MAX_DISCOVERY_BYTES), MAX_DISCOVERY_BYTES)
+                    val response = DatagramPacket(
+                        ByteArray(MAX_DISCOVERY_BYTES),
+                        MAX_DISCOVERY_BYTES,
+                    )
                     try {
                         socket.receive(response)
                     } catch (_error: SocketTimeoutException) {
                         continue
                     }
-                    val reply = parseReply(response.data.copyOfRange(0, response.length), nonce) ?: continue
-                    val host = response.address?.hostAddress ?: continue
-                    val bridge = DiscoveredBridge(
-                        host = host,
-                        port = reply.port,
-                        name = reply.model.ifBlank { reply.deviceId },
-                        version = reply.firmware,
-                        deviceId = reply.deviceId,
-                        bridgeInstanceId = reply.bridgeInstanceId,
-                    )
-                    found[dedupeKey(bridge)] = bridge
+                    consume(response)
+                }
+
+                // Phase 2: many routers drop client-to-client broadcasts while
+                // ordinary unicast still works, which leaves a reachable Bridge
+                // invisible. Sweep the local /24 with unicast probes as a fallback.
+                if (found.isEmpty()) {
+                    val sweepTargets = unicastSweepTargets()
+                    if (sweepTargets.isNotEmpty()) {
+                        sweepTargets.forEach { target ->
+                            listOf(request, LEGACY_REQUEST).forEach { payload ->
+                                runCatching {
+                                    socket.send(
+                                        DatagramPacket(payload, payload.size, target, discoveryPort),
+                                    )
+                                }
+                            }
+                        }
+                        pump(System.currentTimeMillis() + SWEEP_TIMEOUT_MS)
+                    }
                 }
                 found.values.toList()
             } catch (_error: Exception) {
@@ -171,6 +218,33 @@ object Discovery {
                 socket.close()
             }
         }
+
+    /**
+     * Every host address in the /24 around each local site-local IPv4 address.
+     *
+     * Home routers almost always use a /24, and probing it is cheap (a few
+     * hundred tiny datagrams) compared with asking the user to type an address.
+     */
+    private fun unicastSweepTargets(): List<InetAddress> {
+        val targets = linkedSetOf<String>()
+        runCatching {
+            NetworkInterface.getNetworkInterfaces().toList().forEach { network ->
+                if (!network.isUp || network.isLoopback) return@forEach
+                network.inetAddresses.toList()
+                    .filterIsInstance<Inet4Address>()
+                    .filter { it.isSiteLocalAddress }
+                    .forEach { address ->
+                        val bytes = address.address
+                        val prefix = "${bytes[0].toUByte()}.${bytes[1].toUByte()}.${bytes[2].toUByte()}"
+                        for (host in 1..254) {
+                            val candidate = "$prefix.$host"
+                            if (candidate != address.hostAddress) targets.add(candidate)
+                        }
+                    }
+            }
+        }
+        return targets.mapNotNull { runCatching { InetAddress.getByName(it) }.getOrNull() }
+    }
 
     internal fun discoveryRequest(
         nonce: ByteArray,
