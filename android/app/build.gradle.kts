@@ -15,8 +15,8 @@ android {
         applicationId = "com.codexbridge.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 50
-        versionName = "1.2.13"
+        versionCode = 51
+        versionName = "1.2.14"
         resourceConfigurations += listOf("zh", "en")
     }
 

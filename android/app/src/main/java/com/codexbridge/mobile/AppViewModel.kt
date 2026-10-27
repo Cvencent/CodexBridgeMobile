@@ -357,7 +357,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 deviceId = settings.phoneId.ifBlank { settings.installationId },
             )
         }.getOrDefault(emptyList())
-        if (found.isEmpty()) return RediscoveryOutcome.NotFound
+        if (found.isEmpty()) {
+            // Discovery can be blocked by the router even when the Bridge is
+            // perfectly reachable. Try every address the user has ever had
+            // working before declaring failure.
+            return tryStoredAddresses()
+        }
 
         val storedPort = runCatching {
             java.net.URI(ApiClient.normalizeBase(settings.baseUrl)).port
@@ -415,6 +420,47 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         return RediscoveryOutcome.Migrated
+    }
+
+    /**
+     * Last resort when discovery finds nothing: reuse an address already stored
+     * on this phone. Broadcast filtering on the router makes discovery fail
+     * while plain unicast still works, so this recovers without user action.
+     */
+    private suspend fun tryStoredAddresses(): RediscoveryOutcome {
+        val token = settings.token
+        if (token.isBlank()) return RediscoveryOutcome.NotFound
+        val ordered = listOf(
+            settings.lastSuccessfulUrl,
+            settings.lanUrl,
+            settings.baseUrl,
+            settings.wanUrl,
+        ).map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        for (url in ordered) {
+            val normalized = runCatching { ApiClient.normalizeBase(url) }.getOrNull() ?: continue
+            val client = ApiClient(normalized, token, settings.phoneId)
+            val verified = runCatching { client.threads() }
+            if (verified.isSuccess) {
+                settings.baseUrl = normalized
+                settings.lastSuccessfulUrl = normalized
+                api?.close()
+                api = client
+                _state.update {
+                    it.copy(baseUrl = normalized, connected = true, error = null)
+                }
+                return RediscoveryOutcome.Migrated
+            }
+            val rejected = verified.exceptionOrNull() is ApiException &&
+                (verified.exceptionOrNull() as ApiException).unauthorized
+            client.close()
+            if (rejected) {
+                // This address really is the paired Bridge; only the token is dead.
+                settings.baseUrl = normalized
+                settings.lastSuccessfulUrl = normalized
+                return RediscoveryOutcome.TokenRejected
+            }
+        }
+        return RediscoveryOutcome.NotFound
     }
 
     private fun isOnWifi(): Boolean {
@@ -2199,7 +2245,8 @@ working = if (activeMatches) {
                         )
                         RediscoveryOutcome.NotFound -> _state.update {
                             it.copy(
-                                error = "找不到已配对的 Codex Bridge，请确认手机和电脑在同一网络",
+                                error = "连不上电脑：请确认手机和电脑在同一 Wi-Fi，" +
+                                    "或在设置里把内网地址直接填成电脑的地址（如 192.168.0.49:8568）",
                                 connected = false,
                             )
                         }

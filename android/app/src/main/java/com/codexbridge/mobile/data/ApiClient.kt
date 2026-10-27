@@ -162,7 +162,7 @@ class ApiClient(
                 deviceId = phoneId.ifBlank { "android" },
                 token = token.orEmpty(),
                 model = "android",
-                firmware = "1.2.13",
+                firmware = "1.2.14",
                 client = SharedHttp.stream,
             )
             cbdp = created
