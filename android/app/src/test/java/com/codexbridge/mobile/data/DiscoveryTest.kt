@@ -139,3 +139,41 @@ class BridgeIdentityMatchTest {
         assertNull(match)
     }
 }
+
+class LegacyMatchAcrossUpgradeTest {
+    private fun bridge(version: String) = DiscoveredBridge(
+        host = "192.168.0.49",
+        port = 8568,
+        name = "DESKTOP-A",
+        version = version,
+        deviceId = "bridge-cc",
+        bridgeInstanceId = ByteArray(16) { 0xcc.toByte() },
+    )
+
+    @Test
+    fun aBridgeUpgradeDoesNotBreakALegacyRecord() {
+        // Stored version was 2.2.11, the Bridge is now 2.2.13.
+        val match = matchDiscoveredBridge(
+            discovered = listOf(bridge("2.2.13")),
+            storedInstanceId = "",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.2.11",
+            storedPort = 8568,
+        )
+        assertEquals("192.168.0.49", match?.bridge?.host)
+        assertEquals(true, match?.adoptedIdentity)
+    }
+
+    @Test
+    fun versionStillBreaksATieBetweenSameNameHosts() {
+        val other = bridge("2.2.11").copy(host = "192.168.0.50", deviceId = "bridge-dd")
+        val match = matchDiscoveredBridge(
+            discovered = listOf(bridge("2.2.13"), other),
+            storedInstanceId = "",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.2.11",
+            storedPort = 8568,
+        )
+        assertEquals("192.168.0.50", match?.bridge?.host)
+    }
+}

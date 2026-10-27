@@ -317,6 +317,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     RediscoveryOutcome.TokenRejected -> promptRepair("配对令牌已失效，请重新配对")
+                    RediscoveryOutcome.IdentityChanged -> promptRepair(
+                        "已找到电脑，但 Bridge 身份已变化（可能重装过），请重新配对",
+                    )
                     RediscoveryOutcome.NotFound -> _state.update {
                         it.copy(connected = false)
                     }
@@ -334,6 +337,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         /** Nothing matched: keep the pairing and report a network problem. */
         NotFound,
+
+        /** A Bridge answered, but it is not the instance this phone paired to. */
+        IdentityChanged,
     }
 
     /**
@@ -363,7 +369,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             storedName = settings.bridgeName,
             storedVersion = settings.bridgeVersion,
             storedPort = storedPort,
-        ) ?: return RediscoveryOutcome.NotFound
+        ) ?: return if (settings.bridgeInstanceId.isNotBlank() &&
+            found.any { it.name == settings.bridgeName }
+        ) {
+            // The machine is there but its Bridge identity was regenerated
+            // (reinstall / companion.json reset), so the old token cannot work.
+            RediscoveryOutcome.IdentityChanged
+        } else {
+            RediscoveryOutcome.NotFound
+        }
 
         val newBase = match.bridge.baseUrl
         val token = settings.token
@@ -2180,6 +2194,9 @@ working = if (activeMatches) {
                             }
                         }
                         RediscoveryOutcome.TokenRejected -> promptRepair(friendly(error))
+                        RediscoveryOutcome.IdentityChanged -> promptRepair(
+                            "已找到电脑，但 Bridge 身份已变化（可能重装过），请重新配对",
+                        )
                         RediscoveryOutcome.NotFound -> _state.update {
                             it.copy(
                                 error = "找不到已配对的 Codex Bridge，请确认手机和电脑在同一网络",

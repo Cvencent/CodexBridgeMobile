@@ -89,8 +89,13 @@ fun matchDiscoveredBridge(
         return BridgeMatch(hit, adoptedIdentity = false)
     }
     if (storedName.isBlank()) return null
-    val candidates = discovered.filter {
-        it.name == storedName && it.version == storedVersion && it.port == storedPort
+    // A Bridge upgrade changes its version, so version alone must not break an
+    // otherwise unique match. Use it only to break a tie.
+    val byNameAndPort = discovered.filter { it.name == storedName && it.port == storedPort }
+    val candidates = if (byNameAndPort.size == 1) {
+        byNameAndPort
+    } else {
+        byNameAndPort.filter { it.version == storedVersion }
     }
     if (candidates.size != 1) return null
     return BridgeMatch(candidates.single(), adoptedIdentity = true)
