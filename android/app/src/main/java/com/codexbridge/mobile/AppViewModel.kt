@@ -374,14 +374,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             storedName = settings.bridgeName,
             storedVersion = settings.bridgeVersion,
             storedPort = storedPort,
-        ) ?: return if (settings.bridgeInstanceId.isNotBlank() &&
-            found.any { it.name == settings.bridgeName }
-        ) {
-            // The machine is there but its Bridge identity was regenerated
-            // (reinstall / companion.json reset), so the old token cannot work.
-            RediscoveryOutcome.IdentityChanged
-        } else {
-            RediscoveryOutcome.NotFound
+        ) ?: run {
+            // The instance id no longer matches. That does NOT mean the pairing
+            // is dead: a Bridge may have regenerated its id while keeping the
+            // phone record. Prove it with the token instead of guessing.
+            val sameName = found.filter { it.name == settings.bridgeName }
+            if (sameName.isNotEmpty()) {
+                return verifyStoredTokenOn(sameName)
+            }
+            return RediscoveryOutcome.NotFound
         }
 
         val newBase = match.bridge.baseUrl
@@ -457,6 +458,56 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // This address really is the paired Bridge; only the token is dead.
                 settings.baseUrl = normalized
                 settings.lastSuccessfulUrl = normalized
+                return RediscoveryOutcome.TokenRejected
+            }
+        }
+        return RediscoveryOutcome.NotFound
+    }
+
+    /**
+     * Try the stored token against a candidate that reports the same machine
+     * name but a different instance id.
+     *
+     * A regenerated id must not cost the user a re-pair: if the token is still
+     * accepted, adopt the new id silently. Only an explicit 401 means the phone
+     * record is really gone.
+     */
+    private suspend fun verifyStoredTokenOn(
+        candidates: List<DiscoveredBridge>,
+    ): RediscoveryOutcome {
+        val token = settings.token
+        if (token.isBlank()) return RediscoveryOutcome.TokenRejected
+        for (candidate in candidates) {
+            val url = candidate.baseUrl
+            val client = ApiClient(url, token, settings.phoneId)
+            val verified = runCatching { client.threads() }
+            if (verified.isSuccess) {
+                settings.baseUrl = url
+                settings.lanUrl = url
+                settings.lastSuccessfulUrl = url
+                settings.bridgeInstanceId = candidate.instanceIdHex
+                if (candidate.deviceId.isNotBlank()) settings.bridgeDeviceId = candidate.deviceId
+                if (candidate.name.isNotBlank()) settings.bridgeName = candidate.name
+                if (candidate.version.isNotBlank()) settings.bridgeVersion = candidate.version
+                api?.close()
+                api = client
+                _state.update {
+                    it.copy(
+                        baseUrl = url,
+                        lanUrl = url,
+                        activeRouteRole = "lan",
+                        connected = true,
+                        error = null,
+                    )
+                }
+                return RediscoveryOutcome.Migrated
+            }
+            val error = verified.exceptionOrNull()
+            val rejected = error is ApiException && error.unauthorized
+            client.close()
+            if (rejected) {
+                settings.baseUrl = url
+                settings.lastSuccessfulUrl = url
                 return RediscoveryOutcome.TokenRejected
             }
         }

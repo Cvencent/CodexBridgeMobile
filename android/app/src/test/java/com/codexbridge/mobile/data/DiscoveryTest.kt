@@ -177,3 +177,45 @@ class LegacyMatchAcrossUpgradeTest {
         assertEquals("192.168.0.50", match?.bridge?.host)
     }
 }
+
+class InstanceIdMismatchIsNotRejectionTest {
+    private fun bridge(host: String, instance: String, name: String = "DESKTOP-A") =
+        DiscoveredBridge(
+            host = host,
+            port = 8568,
+            name = name,
+            version = "2.2.13",
+            deviceId = "bridge-$instance",
+            bridgeInstanceId = ByteArray(16) { instance.toInt(16).toByte() },
+        )
+
+    @Test
+    fun aDifferentInstanceIdFailsTheMatchSoTheCallerCanVerifyTheToken() {
+        // match() must NOT silently accept a different instance; the ViewModel
+        // verifies the stored token instead of immediately demanding a re-pair.
+        val match = matchDiscoveredBridge(
+            discovered = listOf(bridge("192.168.0.49", "cc")),
+            storedInstanceId = "298597748cf2a51e608b0fed3bc6fa12",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.2.13",
+            storedPort = 8568,
+        )
+        assertNull(match)
+    }
+
+    @Test
+    fun theMatchingInstanceStillWinsWhenSeveralAreDiscovered() {
+        val match = matchDiscoveredBridge(
+            discovered = listOf(
+                bridge("192.168.0.50", "cc"),
+                bridge("192.168.0.49", "dd"),
+            ),
+            storedInstanceId = "dddddddddddddddddddddddddddddddd",
+            storedName = "DESKTOP-A",
+            storedVersion = "2.2.13",
+            storedPort = 8568,
+        )
+        assertEquals("192.168.0.49", match?.bridge?.host)
+        assertEquals(false, match?.adoptedIdentity)
+    }
+}
